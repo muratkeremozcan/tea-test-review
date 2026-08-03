@@ -1,0 +1,134 @@
+# The `unit` job always runs and needs no secret and no dependency install.
+#
+# The `smoke` job runs the action against this repository's own test file, which
+# is the only way to prove the parts unit tests cannot reach: the npm pack and
+# tar unpack, the global install, the real CLI invocation, and the live PR
+# comment write.
+#
+# NOT YET ENABLED: no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN repository
+# secret exists yet, so the smoke job detects their absence and reports that it
+# was skipped instead of failing. A fresh clone stays green.
+#
+# To enable it, add one of the two secrets. Nothing else needs changing.
+#   - ANTHROPIC_API_KEY: pay-per-token via the Anthropic Console.
+#   - CLAUDE_CODE_OAUTH_TOKEN: a long-lived token minted from an existing Claude
+#     subscription with `claude setup-token`. No separate API billing.
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # No dependencies by design, so there is nothing to install.
+      # The glob is deliberately unquoted so the shell expands it into explicit
+      # paths: `node --test` only learned to expand globs itself in Node 22, and a
+      # quoted pattern is passed through verbatim and not found on older runtimes.
+      - name: Unit tests
+        run: node --test tests/*.test.js
+
+  smoke:
+    name: the review against this repo's own tests
+    runs-on: ubuntu-latest
+    # Forks receive no secrets, so the review cannot run for them at all. This is
+    # the same guard every caller needs; see README.md.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write # for the live comment write, which is the point of this job
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the review diffs against the base ref
+          persist-credentials: false
+
+      # The secrets context is not readable from a job-level `if:`, so the
+      # presence check is a step. Without it this job would fail on every PR to a
+      # repository that has not added a credential yet, which is a red check that
+      # says nothing about the action.
+      - name: Is there a credential to run the review with
+        id: creds
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "${ANTHROPIC_API_KEY}" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN}" ]; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'present=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::No ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN secret, so the live review was skipped. This job proves nothing today.'
+          fi
+
+      # --agent none through extra-args: the CLI builds the prompt and stops, so
+      # this costs no tokens and no minutes. It still exercises npm pack, the tar
+      # unpack, the global install, the CLI argv, and the comment create path.
+      # First, so the run below proves the update path rather than the create one.
+      - name: Dry run, creating the comment
+        if: steps.creds.outputs.present == 'true'
+        uses: ./
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          extra-args: --agent none
+
+      # The real thing: a live agent run against this repository's own test file.
+      # min-files 0 because a commit that changes no test file skips the review,
+      # and a skip must not fail this job. fail-on block so only the worst verdict
+      # reds this repo's own PRs; the verdict is being exercised, not enforced.
+      - name: Live review, updating the same comment
+        id: review
+        if: steps.creds.outputs.present == 'true'
+        uses: ./
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          test-dir: tests
+          min-files: '0'
+          fail-on: block
+
+      - name: Upload the report, the way a caller would
+        if: always() && steps.creds.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tea-test-review
+          path: |
+            test-review.md
+            test-review.json
+          if-no-files-found: ignore
+
+      # One comment carrying the marker, not two. Upserting is what keeps a PR
+      # with ten pushes from collecting ten reviews, and the lookup that makes it
+      # work is the one path a stubbed fetch cannot prove.
+      - name: Assert the second run updated rather than duplicated
+        if: always() && steps.creds.outputs.present == 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          owned=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments?per_page=100" \
+            --jq '[.[] | select(.body | contains("<!-- tea-test-review -->"))]')
+          count=$(echo "${owned}" | jq 'length')
+          echo "comments owned by tea-test-review: ${count}"
+          test "${count}" -eq 1
+
+      - name: Report what the action returned
+        if: always() && steps.creds.outputs.present == 'true'
+        env:
+          OUTPUTS: ${{ toJSON(steps.review.outputs) }}
+        run: echo "${OUTPUTS}"

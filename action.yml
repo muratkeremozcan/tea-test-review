@@ -1,0 +1,255 @@
+name: 'TEA Test Review'
+description: |
+  Runs the headless TEA test-quality review against a pull request's changed test
+  files, fails the step on the review verdict, and publishes the full report as a
+  single upserted PR comment.
+
+  This packages cli/examples/pr-test-review.yml from
+  bmad-method-test-architecture-enterprise into one step: pin and unpack the
+  review skill from an npm tarball, install the pinned CLI and agent, run
+  tea-test-review, then comment. Two jobs and ~230 lines of YAML per repository
+  become one `uses:`.
+
+  What it does not do, and why:
+
+    - No artifact upload. That needs @actions/artifact and ACTIONS_RUNTIME_TOKEN,
+      and this action carries no dependencies. The report and verdict stay in the
+      workspace at report-path and json-path, so a caller that wants artifacts
+      adds actions/upload-artifact itself. The full report is inlined in the PR
+      comment anyway, which is the reason the comment exists.
+    - No fork coverage. Fork pull requests receive no secrets, so the review
+      cannot run for them at all. Guard the job with an `if:` on the caller's
+      side; see README.md, and read the fork caveat there before making this a
+      required check.
+
+  Zero dependencies: no node_modules to audit, no bundle step, and no
+  third-party JavaScript between a pull request and the verdict that blocks it.
+
+inputs:
+  # ─── agent and credentials ──────────────────────────────────────────────────
+  agent:
+    description: |
+      Which agent CLI executes the review. 'claude' and 'codex' are both proven
+      by a live run and both natively supported by the review CLI's own adapter
+      table (cli/lib/agent-adapters.js) — this action passes the value straight
+      through as --agent.
+
+      Any other value is treated as a custom vendor and needs agent-package, and
+      usually agent-command and agent-key-env, so a new vendor is data you pass
+      rather than a change to this action. The ceiling is not here though: a
+      custom vendor runs by impersonating claude's protocol through --agent-cmd
+      (the review CLI's own --agent only accepts claude, codex or none), so it
+      has to accept claude's fixed argv (`-p --output-format text --tools ...
+      --safe-mode`) and the prompt on stdin, or the run fails inside the CLI as
+      an agent error. Prove a vendor with a live run before requiring it as a
+      gate.
+    required: false
+    default: 'claude'
+  anthropic-api-key:
+    description: |
+      Anthropic Console API key, pay-per-token. Passed to the agent as
+      ANTHROPIC_API_KEY. Use this or claude-code-oauth-token, not both.
+
+      May also be supplied through the step's own `env:` instead of here.
+    required: false
+    default: ''
+  claude-code-oauth-token:
+    description: |
+      Long-lived token generated from an existing Claude subscription with
+      `claude setup-token`, so the review bills against that subscription rather
+      than a separate API account. Passed to the agent as
+      CLAUDE_CODE_OAUTH_TOKEN.
+    required: false
+    default: ''
+  openai-api-key:
+    description: |
+      OpenAI API key, pay-per-token, for `agent: codex`. Passed to the agent as
+      OPENAI_API_KEY. `codex login` (stored under the runner's $HOME) works too;
+      set this only when you want a service-account key instead of a login.
+
+      May also be supplied through the step's own `env:` instead of here.
+    required: false
+    default: ''
+  agent-api-key:
+    description: |
+      Credential for a custom vendor (one outside claude/codex), written into
+      the environment variable named by agent-key-env. Ignored for claude and
+      codex, which have their own dedicated inputs above.
+    required: false
+    default: ''
+  agent-key-env:
+    description: |
+      Environment variable name that carries a custom vendor's credential, e.g.
+      GEMINI_API_KEY. Also added to the review CLI's --env-pass allowlist, which
+      is required: the CLI hands the agent a minimal environment and drops every
+      name it was not told about. Not used for claude or codex.
+    required: false
+    default: ''
+  agent-package:
+    description: |
+      npm spec for the agent CLI, version included, e.g. '@google/gemini-cli@0.5.0'.
+      Required for a custom vendor. For 'claude' or 'codex' it overrides the
+      package built from claude-code-version / codex-version.
+    required: false
+    default: ''
+  agent-command:
+    description: |
+      Executable the review CLI spawns. Defaults to the agent's own name
+      ('claude', 'codex', or a custom vendor's `agent` value). Passed through as
+      --agent-cmd only when it differs from the resolved --agent value passed to
+      the CLI.
+    required: false
+    default: ''
+
+  # ─── pinned versions ────────────────────────────────────────────────────────
+  tea-version:
+    description: |
+      Exact version of bmad-method-test-architecture-enterprise supplying both
+      the CLI and the review skill. Pin it, vet that version once, and bump the
+      pin deliberately: this is the reviewer's control plane, and `latest` means
+      whatever resolves on the day a pull request lands.
+
+      It has to be a version that ships the tea-test-review bin. As of 1.19.1 no
+      published version does: the package publishes the review skill, and the
+      headless CLI is newer than the newest release. The action checks the
+      unpacked tarball and fails with that explanation before installing
+      anything. See README.md.
+    required: false
+    default: '1.19.1'
+  claude-code-version:
+    description: 'Exact version of @anthropic-ai/claude-code to install. Pinned for the same reason as tea-version.'
+    required: false
+    default: '2.1.220'
+  codex-version:
+    description: 'Exact version of @openai/codex to install, for `agent: codex`. Pinned for the same reason as tea-version.'
+    required: false
+    default: '0.146.0'
+
+  # ─── review scope ───────────────────────────────────────────────────────────
+  base-ref:
+    description: |
+      Git ref the changed-test diff is taken against. Defaults to
+      origin/<the PR base branch> when this runs on a pull_request event, and
+      origin/main otherwise. Needs a full-history checkout (fetch-depth: 0).
+    required: false
+    default: ''
+  test-dir:
+    description: "test_dir hint passed to the skill. The CLI's own default is 'tests'."
+    required: false
+    default: ''
+  scope:
+    description: "review_scope override: 'single', 'directory' or 'suite'. Derived from the review-set size when empty."
+    required: false
+    default: ''
+
+  # ─── gate policy ────────────────────────────────────────────────────────────
+  min-score:
+    description: 'Fail when the quality score is below this (0-100). No floor when empty.'
+    required: false
+    default: ''
+  max-critical:
+    description: 'Fail when Critical violations exceed this. No cap when empty.'
+    required: false
+    default: ''
+  min-files:
+    description: "Fail when fewer than this many files were reviewed. The CLI's own default is 1."
+    required: false
+    default: ''
+  fail-on:
+    description: "Weakest recommendation that fails the step: 'request-changes' (the CLI's default) or 'block'."
+    required: false
+    default: ''
+
+  # ─── TEA config keys ────────────────────────────────────────────────────────
+  # Stated rather than left to resolution on purpose. CI installs the skill from
+  # a tarball, so no _bmad/tea/config.yaml exists and an unstated key is one the
+  # agent settles per run: identical files then get reviewed against different
+  # knowledge. Empty means "let the CLI resolve it", which is the documented
+  # module default and is correct for most repositories; a contract-testing repo
+  # that leaves use-pactjs-utils empty silently loses its pactjs-utils fragments.
+  use-playwright-utils:
+    description: "Force tea_use_playwright_utils: 'true' or 'false'. Empty leaves the CLI's resolution alone (module default: true)."
+    required: false
+    default: ''
+  use-pactjs-utils:
+    description: |
+      Force tea_use_pactjs_utils: 'true' or 'false'. Empty leaves the CLI's
+      resolution alone (module default: false).
+
+      Set it to 'true' in a repository that does contract testing. Left at the
+      default, the review loads the generic contract-testing fragment instead of
+      the pactjs-utils set and will not flag a missing determinism gate.
+    required: false
+    default: ''
+  pact-mcp:
+    description: "Force tea_pact_mcp: 'mcp' or 'none'. Empty leaves the CLI's resolution alone (module default: none)."
+    required: false
+    default: ''
+
+  extra-args:
+    description: |
+      Arguments appended to the tea-test-review command verbatim, for flags this
+      action does not model: --files, --test-glob, --timeout-ms, --fail-on-skip,
+      --waive/--waive-until, --claude-arg, --isolate/--no-isolate, --env-pass.
+      Quoted like a shell argument list, e.g.
+      --waive "flaky suite, ticket FP-1234" --waive-until 2026-09-30
+    required: false
+    default: ''
+
+  # ─── output files ───────────────────────────────────────────────────────────
+  report-path:
+    description: 'Where the agent writes the markdown report, relative to the workspace.'
+    required: false
+    default: 'test-review.md'
+  json-path:
+    description: 'Where the CLI writes the machine-readable verdict, relative to the workspace.'
+    required: false
+    default: 'test-review.json'
+
+  # ─── PR comment ─────────────────────────────────────────────────────────────
+  comment:
+    description: |
+      Publish the verdict as a PR comment, upserted on a hidden marker so a
+      pushed commit updates one comment instead of appending another. Needs
+      `pull-requests: write`. Silently does nothing when there is no pull request
+      in context.
+
+      A comment that cannot be posted is a warning, never a failure: the verdict
+      is the step's exit code, and losing the comment must not turn a passing
+      review red or a failing one green.
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Token used to read and write the PR comment. Needs pull-requests: write.'
+    required: false
+    default: '${{ github.token }}'
+  github-api-url:
+    description: 'GitHub API base URL. Set automatically; override only for GHES.'
+    required: false
+    default: '${{ github.api_url }}'
+
+outputs:
+  recommendation:
+    description: "'Approve', 'Approve with Comments', 'Request Changes' or 'Block'. Empty on a skipped review."
+  quality-score:
+    description: 'Quality score out of 100. Empty on a skipped review.'
+  critical:
+    description: 'Critical violation count.'
+  high:
+    description: 'High violation count.'
+  medium:
+    description: 'Medium violation count.'
+  low:
+    description: 'Low violation count.'
+  reviewed-files:
+    description: 'Number of files the report says it reviewed. This is the manifest --min-files evaluates, not the diff size.'
+  skipped:
+    description: "'true' when there were no changed test files to review. A skip and a pass both exit 0, so this is the only way to tell them apart."
+  report-path:
+    description: 'Workspace-relative path of the markdown report, for an actions/upload-artifact step.'
+  json-path:
+    description: 'Workspace-relative path of the verdict JSON.'
+
+runs:
+  using: node24
+  main: 'main.js'
