@@ -126,6 +126,23 @@ with:
 Review scope: `base-ref` (derived from the event, so a pull request into a
 release branch diffs against that branch), `test-dir`, `scope`.
 
+Which model reviews: `model`. Left empty the review CLI applies its own
+per-vendor pinned default (`claude`: `sonnet`, `codex`: `gpt-5.6-sol`), so a run
+here and a run on a laptop use the same reviewer. This input picks a different
+one; it does not decide whether a model is pinned.
+
+```yaml
+with:
+  agent: codex
+  model: gpt-5.6-sol
+```
+
+Set it when the default tier is wrong for your suite, or pin a fully-qualified
+slug when a verdict has to be reproducible across model generations: the
+defaults are aliases that follow the vendor's current model in that tier. The
+model that actually ran comes back in the verdict JSON as `model`, next to
+`agent`, because two scores are only comparable when both match.
+
 TEA config keys: `use-playwright-utils`, `use-pactjs-utils`, `pact-mcp`. Set
 `use-pactjs-utils: 'true'` in a repository that does contract testing:
 
@@ -207,8 +224,9 @@ The ceiling is not in this action. The review CLI's own `--agent` flag only
 accepts `claude`, `codex` or `none`, so a custom vendor runs by impersonating
 claude's protocol through `--agent-cmd`: TEA's `cli/lib/run-agent.js` builds a
 fixed argv for the claude adapter (`-p --output-format text --tools
-Read,Write,Edit,Glob,Grep --allowedTools ... --safe-mode`) and delivers the
-prompt on stdin, so the custom executable has to accept that same grammar.
+Read,Write,Edit,Glob,Grep --allowedTools ... --safe-mode --model <model>`) and
+delivers the prompt on stdin, so the custom executable has to accept that same
+grammar, `--model` included.
 When it does not, the run fails as an agent error (exit 3). The action warns
 on any unproven vendor. Prove one with a live run before requiring it as a
 gate.

@@ -330,6 +330,10 @@ function childEnv(credential, env = process.env, userInfo = os.userInfo()) {
  * top of it only when the resolved command differs from cliAgent itself —
  * which is exactly when agent-command was set, or when the vendor is a
  * custom one impersonating claude's protocol under its own binary name.
+ *
+ * `model` is only forwarded when set. Left empty the review CLI applies its own
+ * per-vendor pinned default, which is still deterministic; the input exists to
+ * choose a different model, not to decide whether one is pinned at all.
  */
 function buildCliArgs(opts) {
   const args = [
@@ -347,6 +351,7 @@ function buildCliArgs(opts) {
 
   if (opts.agentCommand !== opts.cliAgent) args.push('--agent-cmd', opts.agentCommand);
   if (opts.envPass) args.push('--env-pass', opts.envPass);
+  if (opts.model) args.push('--model', opts.model);
   if (opts.testDir) args.push('--test-dir', opts.testDir);
   if (opts.scope) args.push('--scope', opts.scope);
   if (opts.minScore) args.push('--min-score', opts.minScore);
@@ -778,6 +783,7 @@ function buildOptions(env = process.env) {
     reportPath: getInput('report-path', env) || 'test-review.md',
     jsonPath: getInput('json-path', env) || 'test-review.json',
     cli: {
+      model: getInput('model', env),
       testDir: getInput('test-dir', env),
       scope: getInput('scope', env),
       minScore: getInput('min-score', env),

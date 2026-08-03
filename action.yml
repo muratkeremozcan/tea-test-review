@@ -100,6 +100,28 @@ inputs:
       the CLI.
     required: false
     default: ''
+  model:
+    description: |
+      Model the review agent runs on, passed through as --model. Empty leaves
+      the review CLI's own per-vendor pinned default (claude: sonnet, codex:
+      gpt-5.6-sol), which is already deterministic — this input picks a
+      different model, it does not decide whether one is pinned.
+
+      Set it when the default tier is wrong for your suite, or pin a
+      fully-qualified slug when a verdict has to be reproducible across model
+      generations: the CLI's defaults are aliases that follow the vendor's
+      current model in that tier.
+
+      Requires a tea-version whose CLI understands --model; an older CLI fails
+      with an unknown-option error. The model that actually ran is recorded in
+      the verdict JSON as `model`.
+
+      Note for custom vendors: the review CLI now includes a model flag in the
+      fixed argv it hands the agent, so a wrapper impersonating claude's
+      protocol under --agent-cmd has to tolerate `--model <value>` along with
+      the rest of that argv.
+    required: false
+    default: ''
 
   # ─── pinned versions ────────────────────────────────────────────────────────
   tea-version:

@@ -510,6 +510,17 @@ describe('buildCliArgs', () => {
     assert.strictEqual(custom[custom.indexOf('--agent') + 1], 'claude');
   });
 
+  test('model passes through when set', () => {
+    const args = action.buildCliArgs({ ...base, model: 'opus[1m]' });
+    assert.strictEqual(args[args.indexOf('--model') + 1], 'opus[1m]');
+  });
+
+  test('an empty model passes nothing, leaving the CLI\'s per-vendor pinned default in charge', () => {
+    // Absent means "use the pinned default", never "let the vendor CLI decide":
+    // that resolution lives in the CLI's adapter table, not here.
+    assert.ok(!action.buildCliArgs({ ...base, model: '' }).includes('--model'));
+  });
+
   test("a custom vendor's credential is allowlisted with --env-pass", () => {
     const args = action.buildCliArgs({ ...base, envPass: 'GEMINI_API_KEY' });
     assert.strictEqual(args[args.indexOf('--env-pass') + 1], 'GEMINI_API_KEY');
