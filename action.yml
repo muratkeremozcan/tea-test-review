@@ -104,18 +104,20 @@ inputs:
   # ─── pinned versions ────────────────────────────────────────────────────────
   tea-version:
     description: |
-      Exact version of bmad-method-test-architecture-enterprise supplying both
-      the CLI and the review skill. Pin it, vet that version once, and bump the
-      pin deliberately: this is the reviewer's control plane, and `latest` means
-      whatever resolves on the day a pull request lands.
+      Version or dist-tag of bmad-method-test-architecture-enterprise supplying
+      both the CLI and the review skill. Defaults to `latest`, which tracks the
+      newest published release.
 
-      It has to be a version that ships the tea-test-review bin. As of 1.19.1 no
-      published version does: the package publishes the review skill, and the
-      headless CLI is newer than the newest release. The action checks the
-      unpacked tarball and fails with that explanation before installing
-      anything. See README.md.
+      Pin an exact version when you need a reproducible verdict: this is the
+      reviewer's control plane, and `latest` means whatever resolves on the day
+      a pull request lands.
+
+      It has to be a version that ships the tea-test-review bin. 1.20.0 is the
+      first that does; earlier releases publish the review skill with an empty
+      `bin`. The action checks the unpacked tarball and fails with that
+      explanation before installing anything. See README.md.
     required: false
-    default: '1.19.1'
+    default: 'latest'
   claude-code-version:
     description: 'Exact version of @anthropic-ai/claude-code to install. Pinned for the same reason as tea-version.'
     required: false

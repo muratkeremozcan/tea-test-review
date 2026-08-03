@@ -62,19 +62,21 @@ Node 22 or newer is installed on GitHub-hosted runners already, so no
 
 ### `tea-version` has to be a version that ships the CLI
 
-No published version does yet. `bmad-method-test-architecture-enterprise@1.19.1`
-publishes the review *skill* and declares an empty `bin`, and the headless
-`tea-test-review` CLI is newer than that release. npm versions are immutable, so
-1.19.1 will not gain it later.
+`bmad-method-test-architecture-enterprise@1.20.0` is the first release that does.
+Every earlier version publishes the review *skill* and declares an empty `bin`,
+and npm versions are immutable, so those will not gain it later.
 
-The action checks the unpacked tarball's `package.json` before installing
-anything and fails with that explanation, rather than letting the run die on
-`tea-test-review not found on PATH` two installs later. Set `tea-version` to the
-first release that ships the CLI:
+The default is `latest`, so a fresh caller gets a release that ships the CLI
+without pinning anything. The action still checks the unpacked tarball's
+`package.json` before installing anything and fails with that explanation,
+rather than letting the run die on `tea-test-review not found on PATH` two
+installs later.
+
+Pin an exact version when you want the verdict to be reproducible:
 
 ```yaml
 with:
-  tea-version: '1.20.0' # whatever version first ships the bin
+  tea-version: '1.20.0'
 ```
 
 ## Making it a required check
@@ -233,13 +235,13 @@ environment / adapter `envNames`.
   cannot rewrite the reviewer that judges it. The residual trust is the pinned
   version as published: vet it once, pin it exactly, bump it deliberately.
 - **A TEA version that ships no CLI fails before installing anything.** See
-  above. The default of `1.19.1` matches the current published release and the
-  reference workflow, and it cannot work until the CLI is released; the same is
-  true of `cli/examples/pr-test-review.yml` in the TEA repository today.
-- **Every version is pinned, and pinning is the point.** `tea-version` and the
-  agent version you actually use (`claude-code-version` or `codex-version`) are
-  the reviewer's control plane. `latest` means whatever resolves on the day a
-  pull request lands.
+  above. The default of `latest` cannot hit that case on its own; an explicit
+  pin below 1.20.0 can.
+- **The agent versions stay pinned, and `tea-version` defaults to `latest`.**
+  `claude-code-version` and `codex-version` are exact because a vendor CLI
+  changes its own behaviour under you. `tea-version` follows the newest release
+  so callers do not carry a bump, which trades reproducibility for currency:
+  pin it when a verdict has to be reproducible.
 - **The comment is upserted on a hidden marker**, so ten pushes update one
   comment instead of leaving ten. A comment that cannot be written is a warning
   and never changes the verdict, because the verdict is the step's exit code.

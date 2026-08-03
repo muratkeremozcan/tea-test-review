@@ -387,9 +387,9 @@ function packedTarballName(stdout, dirEntries = []) {
  * PATH` after two installs, which reads like a runner problem rather than a
  * version that never had the binary.
  *
- * Not hypothetical: as of 1.19.1, no published version ships it. The package
- * publishes the review skill, the CLI that drives it headlessly is newer than the
- * newest release, and npm versions are immutable, so 1.19.1 will never gain it.
+ * Not hypothetical: every release before 1.20.0 publishes the review skill with
+ * an empty `bin`, and npm versions are immutable, so those will never gain it.
+ * Reachable through `latest` only by a downgrade, and through an explicit pin.
  */
 function assertShipsCli(packageJson, spec) {
   const bin = packageJson?.bin;
@@ -737,7 +737,7 @@ function buildOptions(env = process.env) {
   return {
     agent,
     credential,
-    teaVersion: getInput('tea-version', env) || '1.19.1',
+    teaVersion: getInput('tea-version', env) || 'latest',
     baseRef: resolveBaseRef(getInput('base-ref', env), env),
     reportPath: getInput('report-path', env) || 'test-review.md',
     jsonPath: getInput('json-path', env) || 'test-review.json',
