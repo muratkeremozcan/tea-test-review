@@ -182,6 +182,14 @@ with:
   openai-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
 
+codex needs one thing claude does not, and this action does it for you: codex
+0.146.0 never reads `OPENAI_API_KEY` from the environment and authenticates
+only from `~/.codex/auth.json`, which no runner has. Handed only the variable,
+it sends no credential at all and the run dies on `401 ... Missing bearer or
+basic authentication in header`. So before running the review, the action pipes
+your key into `codex login --with-api-key` on stdin, never argv, so the
+credential reaches disk without reaching the workflow log.
+
 Any other value is a genuinely custom vendor and needs `agent-package`, and
 usually `agent-command` and `agent-key-env`, so adding one needs no change
 here:
@@ -209,7 +217,9 @@ gate.
 minimal environment and drops every variable it was not told to pass, so an
 unnamed credential never reaches the agent at all. `claude` and `codex` do not
 need it: both credentials are already covered by the CLI's own base
-environment / adapter `envNames`.
+environment / adapter `envNames`. Note that a custom vendor which likewise
+ignores its key variable, as codex does, cannot be fixed with `agent-key-env`
+alone; only built-in vendors get the login step described above.
 
 ## Important behavior
 

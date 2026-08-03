@@ -123,14 +123,17 @@ const AGENTS = {
   codex: {
     package: '@openai/codex',
     command: 'codex',
-    // OPENAI_API_KEY is a fallback: `codex login` (stored under $HOME) works
-    // too, same as claude's subscription login, since the CLI's codex adapter
-    // shares the HOME/USER/LOGNAME base env every vendor gets.
     credentialEnvNames: ['OPENAI_API_KEY'],
     credentialInputs: ['openaiApiKey'],
     // Already in the CLI's codex adapter envNames (cli/lib/agent-adapters.js),
     // so no --env-pass needed, same reasoning as claude.
     needsEnvPass: false,
+    // codex 0.146.0 does not read OPENAI_API_KEY from the environment; it
+    // authenticates only from ~/.codex/auth.json, which no runner has. Passing
+    // the variable alone sends no credential at all and the run dies on
+    // "Missing bearer or basic authentication in header". This writes the file
+    // first. The key travels on stdin, never argv, so it stays out of the log.
+    loginArgv: ['login', '--with-api-key'],
   },
 };
 
@@ -235,6 +238,7 @@ function resolveAgent({ agent, agentPackage, agentCommand, agentKeyEnv, agentVer
       credentialEnvNames: known.credentialEnvNames,
       credentialInputs: known.credentialInputs,
       needsEnvPass: known.needsEnvPass,
+      loginArgv: known.loginArgv,
     };
   }
 
@@ -578,6 +582,38 @@ function runCommandChecked(command, args, options = {}) {
 }
 
 /**
+ * Write the agent's credential to its on-disk auth store, for vendors that
+ * refuse to read it from the environment.
+ *
+ * Only codex needs this today (see the AGENTS table), and only when the
+ * credential is an API key: a subscription login already wrote the file, and
+ * runners have neither. Skipped silently for vendors without a loginArgv so
+ * this stays data rather than a branch per agent.
+ *
+ * stdio is piped rather than inherited, so a vendor that echoes the key back
+ * cannot land it in the workflow log, and the key goes through `input` rather
+ * than argv, so it never appears in a process list either.
+ */
+function agentLogin(agent, credential) {
+  if (!agent.loginArgv) return;
+  log(`+ ${agent.command} ${agent.loginArgv.join(' ')} (credential on stdin)`);
+  const result = spawnSync(binaryName(agent.command), agent.loginArgv, {
+    input: `${credential.value}\n`,
+    encoding: 'utf8',
+  });
+  if (result.error) {
+    if (result.error.code === 'ENOENT') throw new Error(`${agent.command} not found on PATH`);
+    throw new Error(`${agent.command} login failed: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `${agent.command} could not accept the ${credential.name} credential (exit ${result.status}). ` +
+        'The review never ran, so this is a broken gate rather than a verdict.'
+    );
+  }
+}
+
+/**
  * Unpack the review skill from a pinned tarball into a temp directory.
  *
  * Two things this must not do. It must not install the skill globally, because
@@ -822,6 +858,8 @@ async function run() {
 
   runCommandChecked(binaryName('npm'), ['install', '--global', tarballPath, opts.agent.packageSpec]);
 
+  agentLogin(opts.agent, opts.credential);
+
   const args = buildCliArgs({
     ...opts.cli,
     baseRef: opts.baseRef,
@@ -885,6 +923,7 @@ module.exports = {
   parseExtraArgs,
   resolveAgent,
   resolveCredential,
+  agentLogin,
   childEnv,
   buildCliArgs,
   packedTarballName,

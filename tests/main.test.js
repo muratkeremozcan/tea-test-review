@@ -170,6 +170,44 @@ describe('parseExtraArgs', () => {
   });
 });
 
+describe('agentLogin', () => {
+  test('codex is logged in from the credential, because it ignores OPENAI_API_KEY', () => {
+    const agent = action.resolveAgent({ agent: 'codex' });
+    assert.deepStrictEqual(
+      agent.loginArgv,
+      ['login', '--with-api-key'],
+      'codex 0.146.0 authenticates only from ~/.codex/auth.json, which no runner has'
+    );
+  });
+
+  test('claude needs no login step, so the field is absent rather than empty', () => {
+    const agent = action.resolveAgent({ agent: 'claude' });
+    assert.strictEqual(agent.loginArgv, undefined);
+  });
+
+  test('a vendor without loginArgv is a no-op that spawns nothing', () => {
+    // Would throw ENOENT on a bogus command if it tried to spawn.
+    const agent = { command: 'definitely-not-a-real-binary', loginArgv: undefined };
+    assert.doesNotThrow(() => action.agentLogin(agent, { name: 'X', value: 'y' }));
+  });
+
+  test('a failing login is a broken gate, not a verdict', () => {
+    const agent = { command: 'false', loginArgv: [] };
+    assert.throws(
+      () => action.agentLogin(agent, { name: 'OPENAI_API_KEY', value: 'sk-nope' }),
+      /could not accept the OPENAI_API_KEY credential[\s\S]*broken gate/
+    );
+  });
+
+  test('a missing agent binary names itself rather than surfacing ENOENT', () => {
+    const agent = { command: 'definitely-not-a-real-binary', loginArgv: ['login'] };
+    assert.throws(
+      () => action.agentLogin(agent, { name: 'OPENAI_API_KEY', value: 'sk-nope' }),
+      /definitely-not-a-real-binary not found on PATH/
+    );
+  });
+});
+
 describe('resolveAgent', () => {
   test('claude is built in and pins from claude-code-version', () => {
     const agent = action.resolveAgent({ agent: 'claude', agentVersions: { claude: '2.1.220' } });
