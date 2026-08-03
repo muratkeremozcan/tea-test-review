@@ -604,8 +604,58 @@ describe('action.yml defaults', () => {
     assert.strictEqual(buildWith({ INPUT_COMMENT: 'true' }).comment, true);
   });
 
-  test('runs on the node24 runtime with main.js as its entry point', () => {
-    assert.match(ACTION_YML, /^runs:\n  using: node24\n  main: 'main\.js'$/m);
+  test('upload-report defaults to true in action.yml, and main.js deliberately does not repeat it', () => {
+    // Same reasoning as comment: a direct invocation writes nothing outside the
+    // workspace.
+    assert.strictEqual(declaredDefault('upload-report'), 'true');
+    assert.strictEqual(buildWith({}).uploadReport, false);
+    assert.strictEqual(buildWith({ 'INPUT_UPLOAD-REPORT': 'true' }).uploadReport, true);
+  });
+
+  test('runs as a composite action, because a JavaScript action cannot have an upload step', () => {
+    assert.match(ACTION_YML, /^runs:\n  using: composite$/m);
+    assert.match(ACTION_YML, /run: node "\$GITHUB_ACTION_PATH\/main\.js"/);
+  });
+
+  test('node is pinned to 24, which the node24 runtime used to guarantee', () => {
+    // Composite steps run on the image's node, so without this the runtime
+    // moves whenever the runner image does.
+    assert.match(ACTION_YML, /uses: actions\/setup-node@v4\n      with:\n        node-version: '24'/);
+  });
+
+  test('every declared input reaches main.js as an INPUT_ variable', () => {
+    // Composite run steps get no automatic INPUT_* env, so an input declared
+    // but not mapped is silently always its default.
+    const inputsSection = ACTION_YML.slice(ACTION_YML.indexOf('\ninputs:'), ACTION_YML.indexOf('\noutputs:'));
+    const declared = [...inputsSection.matchAll(/^  ([a-z-]+):$/gm)].map((m) => m[1]);
+    assert.ok(declared.length >= 25, `expected the full input surface, saw ${declared.length}`);
+    for (const name of declared) {
+      const envName = `INPUT_${name.toUpperCase()}`;
+      assert.match(ACTION_YML, new RegExp(`^        ${envName}: \\$\\{\\{ inputs\\.${name} \\}\\}$`, 'm'), `composite step does not map ${name}`);
+    }
+  });
+
+  test('every declared output is wired to the review step', () => {
+    const outputsSection = ACTION_YML.slice(ACTION_YML.indexOf('\noutputs:'), ACTION_YML.indexOf('\nruns:'));
+    const declared = [...outputsSection.matchAll(/^  ([a-z-]+):$/gm)].map((m) => m[1]);
+    assert.ok(declared.length >= 10, `expected the full output surface, saw ${declared.length}`);
+    for (const name of declared) {
+      assert.match(outputsSection, new RegExp(`value: \\$\\{\\{ steps\\.review\\.outputs\\.${name} \\}\\}`), `output ${name} has no value`);
+    }
+  });
+
+  test('the report upload runs even on a failing verdict, which is when the report matters most', () => {
+    assert.match(ACTION_YML, /if: always\(\) && inputs\.upload-report == 'true'/);
+    assert.match(ACTION_YML, /uses: actions\/upload-artifact@v4/);
+    // Two invocations in one job (a dry run, then a live review) share the
+    // artifact name, and v4 artifacts are immutable without this.
+    assert.match(ACTION_YML, /overwrite: true/);
+  });
+
+  test('the artifact name in action.yml matches the one main.js promises in the comment', () => {
+    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}/);
+    const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+    assert.match(source, /tea-test-review-\$\{env\.GITHUB_JOB\}/);
   });
 });
 
@@ -727,6 +777,26 @@ describe('buildCommentBody', () => {
     assert.match(body, /\*\*Reviewed files\*\*: 2/);
   });
 
+  test('the digest names every reviewed file, so a finding citing a line number is attributable', () => {
+    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
+    assert.match(body, /- \*\*Reviewed files\*\*: 2\n  - `tests\/checkout\.spec\.ts`\n  - `tests\/cart\.spec\.ts`/);
+  });
+
+  test('past the cap the file list collapses to an overflow line, so the digest stays a digest', () => {
+    const many = { ...verdict, reviewedFiles: Array.from({ length: 12 }, (_, i) => `tests/f${i}.spec.ts`) };
+    const body = action.buildCommentBody({ verdict: many, reportText: '# report', runUrl });
+    assert.match(body, /\*\*Reviewed files\*\*: 12/);
+    assert.match(body, /`tests\/f9\.spec\.ts`/);
+    assert.ok(!body.includes('`tests/f10.spec.ts`'));
+    assert.match(body, /… and 2 more/);
+  });
+
+  test('a malformed reviewedFiles renders as a count of zero rather than undefined', () => {
+    const body = action.buildCommentBody({ verdict: { ...verdict, reviewedFiles: 'oops' }, reportText: '# report', runUrl });
+    assert.match(body, /\*\*Reviewed files\*\*: 0/);
+    assert.ok(!body.includes('undefined'));
+  });
+
   test('at most three key weaknesses, so the digest stays a digest', () => {
     const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
     assert.match(body, /- first/);
@@ -744,15 +814,36 @@ describe('buildCommentBody', () => {
     assert.match(body, /<\/details>/);
   });
 
-  test('an oversize report falls back to a pointer, and says which path holds it', () => {
+  test('a report containing a literal closing details tag cannot end the inline block early', () => {
+    // The zero-width space breaks it as an HTML tag while leaving the visible
+    // text unchanged; without it the rest of the report spills into the comment
+    // as raw markdown.
+    const body = action.buildCommentBody({ verdict, reportText: '# report\n\n</details>\n\nafter', runUrl });
+    assert.strictEqual(body.split('</details>').length - 1, 1);
+    assert.ok(body.includes('<\u200B/details>'));
+  });
+
+  test('an oversize report points at the uploaded artifact, which survives the runner', () => {
     const reportText = 'x'.repeat(action.MAX_INLINE_REPORT_CHARS + 1);
-    const body = action.buildCommentBody({ verdict, reportText, runUrl, reportPath: 'test-review.md' });
+    const body = action.buildCommentBody({
+      verdict,
+      reportText,
+      runUrl,
+      reportPath: 'test-review.md',
+      artifactName: 'tea-test-review-review',
+    });
     assert.ok(!body.includes('<details>'));
     assert.match(body, /too large to inline \(40001 characters, limit 40000\)/);
-    assert.match(body, /`test-review\.md`/);
-    assert.match(body, /actions\/upload-artifact/);
+    assert.match(body, /uploaded as the `tea-test-review-review` artifact on the workflow run/);
     // GitHub rejects a body over 65536, which would lose the verdict entirely.
     assert.ok(body.length < 65536);
+  });
+
+  test('an oversize report with no artifact upload says the workspace copy dies with the job', () => {
+    const reportText = 'x'.repeat(action.MAX_INLINE_REPORT_CHARS + 1);
+    const body = action.buildCommentBody({ verdict, reportText, runUrl, reportPath: 'test-review.md' });
+    assert.match(body, /`test-review\.md`, which the runner deletes when the job ends/);
+    assert.match(body, /enable `upload-report` or add an `actions\/upload-artifact` step/);
   });
 
   test('a report exactly at the cap is still inlined', () => {
@@ -791,6 +882,14 @@ describe('buildCommentBody', () => {
     assert.match(body, /## TEA Test Review: no review performed/);
     assert.match(body, /Files that would have been reviewed: 1\./);
     assert.ok(!body.includes('undefined'));
+  });
+
+  test('a dry run lists the files, because the file set is its whole output', () => {
+    const body = action.buildCommentBody({
+      verdict: { promptOnly: true, files: ['tests/a.spec.ts', 'tests/b.spec.ts'] },
+      runUrl,
+    });
+    assert.match(body, /Files that would have been reviewed: 2\.\n- `tests\/a\.spec\.ts`\n- `tests\/b\.spec\.ts`/);
   });
 
   test('no verdict at all reads as a broken gate, never as approved tests', () => {

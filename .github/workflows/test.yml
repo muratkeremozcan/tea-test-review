@@ -102,15 +102,9 @@ jobs:
           min-files: '0'
           fail-on: block
 
-      - name: Upload the report, the way a caller would
-        if: always() && steps.creds.outputs.present == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: tea-test-review
-          path: |
-            test-review.md
-            test-review.json
-          if-no-files-found: ignore
+      # No caller-side upload step: the action uploads the report itself on
+      # every run, so this job exercises that path twice (the dry run's artifact
+      # is overwritten by the live review's, which is the copy worth keeping).
 
       # One comment carrying the marker, not two. Upserting is what keeps a PR
       # with ten pushes from collecting ten reviews, and the lookup that makes it

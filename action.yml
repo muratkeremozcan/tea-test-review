@@ -1,8 +1,9 @@
 name: 'TEA Test Review'
 description: |
   Runs the headless TEA test-quality review against a pull request's changed test
-  files, fails the step on the review verdict, and publishes the full report as a
-  single upserted PR comment.
+  files, fails the step on the review verdict, publishes the full report as a
+  single upserted PR comment, and uploads the report and verdict JSON as a
+  workflow-run artifact so they survive the runner.
 
   This packages cli/examples/pr-test-review.yml from
   bmad-method-test-architecture-enterprise into one step: pin and unpack the
@@ -12,11 +13,6 @@ description: |
 
   What it does not do, and why:
 
-    - No artifact upload. That needs @actions/artifact and ACTIONS_RUNTIME_TOKEN,
-      and this action carries no dependencies. The report and verdict stay in the
-      workspace at report-path and json-path, so a caller that wants artifacts
-      adds actions/upload-artifact itself. The full report is inlined in the PR
-      comment anyway, which is the reason the comment exists.
     - No fork coverage. Fork pull requests receive no secrets, so the review
       cannot run for them at all. Guard the job with an `if:` on the caller's
       side; see README.md, and read the fork caveat there before making this a
@@ -24,6 +20,7 @@ description: |
 
   Zero dependencies: no node_modules to audit, no bundle step, and no
   third-party JavaScript between a pull request and the verdict that blocks it.
+  The only actions it uses are GitHub's own setup-node and upload-artifact.
 
 inputs:
   # ─── agent and credentials ──────────────────────────────────────────────────
@@ -229,6 +226,14 @@ inputs:
     description: 'Where the CLI writes the machine-readable verdict, relative to the workspace.'
     required: false
     default: 'test-review.json'
+  upload-report:
+    description: |
+      Upload report-path and json-path as the tea-test-review-<job> artifact on
+      the workflow run, even when the verdict fails, so a report too large to
+      inline in the PR comment is still recoverable after the runner is
+      deleted. Set to 'false' to manage artifacts yourself.
+    required: false
+    default: 'true'
 
   # ─── PR comment ─────────────────────────────────────────────────────────────
   comment:
@@ -252,28 +257,102 @@ inputs:
     required: false
     default: '${{ github.api_url }}'
 
+# Every output must name its source step. A composite action's outputs are
+# empty unless each one is wired here, and the test suite pins this 1:1.
 outputs:
   recommendation:
     description: "'Approve', 'Approve with Comments', 'Request Changes' or 'Block'. Empty on a skipped review."
+    value: ${{ steps.review.outputs.recommendation }}
   quality-score:
     description: 'Quality score out of 100. Empty on a skipped review.'
+    value: ${{ steps.review.outputs.quality-score }}
   critical:
     description: 'Critical violation count.'
+    value: ${{ steps.review.outputs.critical }}
   high:
     description: 'High violation count.'
+    value: ${{ steps.review.outputs.high }}
   medium:
     description: 'Medium violation count.'
+    value: ${{ steps.review.outputs.medium }}
   low:
     description: 'Low violation count.'
+    value: ${{ steps.review.outputs.low }}
   reviewed-files:
     description: 'Number of files the report says it reviewed. This is the manifest --min-files evaluates, not the diff size.'
+    value: ${{ steps.review.outputs.reviewed-files }}
   skipped:
     description: "'true' when there were no changed test files to review. A skip and a pass both exit 0, so this is the only way to tell them apart."
+    value: ${{ steps.review.outputs.skipped }}
   report-path:
-    description: 'Workspace-relative path of the markdown report, for an actions/upload-artifact step.'
+    description: 'Workspace-relative path of the markdown report, also uploaded as the tea-test-review-<job> artifact.'
+    value: ${{ steps.review.outputs.report-path }}
   json-path:
     description: 'Workspace-relative path of the verdict JSON.'
+    value: ${{ steps.review.outputs.json-path }}
 
+# Composite rather than a node24 JavaScript action for one reason: a JavaScript
+# action is a single main.js run and cannot have steps, and the report upload
+# below needs one. The trade-off is that composite steps run on the image's
+# node, so setup-node pins back the runtime the node24 form guaranteed.
 runs:
-  using: node24
-  main: 'main.js'
+  using: composite
+  steps:
+    - name: Set up node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    # Composite run steps get no automatic INPUT_* variables the way a
+    # JavaScript action does, so every declared input is mapped by hand. The
+    # test suite pins this mapping 1:1 against the inputs block above: an
+    # unmapped input would silently always be its default.
+    - name: Run the review
+      id: review
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/main.js"
+      env:
+        INPUT_AGENT: ${{ inputs.agent }}
+        INPUT_ANTHROPIC-API-KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_CLAUDE-CODE-OAUTH-TOKEN: ${{ inputs.claude-code-oauth-token }}
+        INPUT_OPENAI-API-KEY: ${{ inputs.openai-api-key }}
+        INPUT_AGENT-API-KEY: ${{ inputs.agent-api-key }}
+        INPUT_AGENT-KEY-ENV: ${{ inputs.agent-key-env }}
+        INPUT_AGENT-PACKAGE: ${{ inputs.agent-package }}
+        INPUT_AGENT-COMMAND: ${{ inputs.agent-command }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_TEA-VERSION: ${{ inputs.tea-version }}
+        INPUT_CLAUDE-CODE-VERSION: ${{ inputs.claude-code-version }}
+        INPUT_CODEX-VERSION: ${{ inputs.codex-version }}
+        INPUT_BASE-REF: ${{ inputs.base-ref }}
+        INPUT_TEST-DIR: ${{ inputs.test-dir }}
+        INPUT_SCOPE: ${{ inputs.scope }}
+        INPUT_MIN-SCORE: ${{ inputs.min-score }}
+        INPUT_MAX-CRITICAL: ${{ inputs.max-critical }}
+        INPUT_MIN-FILES: ${{ inputs.min-files }}
+        INPUT_FAIL-ON: ${{ inputs.fail-on }}
+        INPUT_USE-PLAYWRIGHT-UTILS: ${{ inputs.use-playwright-utils }}
+        INPUT_USE-PACTJS-UTILS: ${{ inputs.use-pactjs-utils }}
+        INPUT_PACT-MCP: ${{ inputs.pact-mcp }}
+        INPUT_EXTRA-ARGS: ${{ inputs.extra-args }}
+        INPUT_REPORT-PATH: ${{ inputs.report-path }}
+        INPUT_JSON-PATH: ${{ inputs.json-path }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_GITHUB-TOKEN: ${{ inputs.github-token }}
+        INPUT_GITHUB-API-URL: ${{ inputs.github-api-url }}
+        INPUT_UPLOAD-REPORT: ${{ inputs.upload-report }}
+
+    # always(): a failing verdict is exactly when the report matters, and a
+    # failed step skips what follows without it. overwrite because two
+    # invocations in one job (a dry run, then a live review) share the name,
+    # and v4 artifacts are immutable otherwise.
+    - name: Upload the report and verdict
+      if: always() && inputs.upload-report == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: tea-test-review-${{ github.job }}
+        path: |
+          ${{ inputs.report-path }}
+          ${{ inputs.json-path }}
+        if-no-files-found: warn
+        overwrite: true

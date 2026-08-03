@@ -2,8 +2,9 @@
 
 `tea-test-review` runs the headless [TEA test-quality review](https://github.com/muratkeremozcan/bmad-method-test-architecture-enterprise)
 against a pull request's changed test files, fails the step on the review
-verdict, and publishes the full report as one upserted PR comment. It has no
-runtime dependencies.
+verdict, publishes the full report as one upserted PR comment, and uploads the
+report as a run artifact. It carries no third-party JavaScript dependencies;
+the only actions it uses are GitHub's own.
 
 It packages what used to be a ~230-line workflow copied into every repository:
 pin and unpack the review skill from an npm tarball, install the pinned CLI and
@@ -90,23 +91,11 @@ cannot use this as its only protection.
 
 ## Artifacts
 
-The action writes `test-review.md` and `test-review.json` into the workspace and
-reports their paths as outputs. It does not upload them: that needs
-`@actions/artifact` and this action carries no dependencies. Add the step
-yourself when you want them:
-
-```yaml
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: tea-test-review
-          path: |
-            test-review.md
-            test-review.json
-```
-
-Most callers do not need this. The comment inlines the whole report already,
-which is why the comment exists.
+The action uploads `report-path` and `json-path` itself, as the
+`tea-test-review-<job>` artifact on the workflow run, on every run including a
+failed verdict. A report too large to inline in the PR comment is therefore
+still recoverable after the runner is deleted; the comment says which artifact
+holds it. Opt out with `upload-report: 'false'` and manage artifacts yourself.
 
 ## Configuration
 
@@ -285,8 +274,10 @@ alone; only built-in vendors get the login step described above.
 node --test tests/*.test.js
 ```
 
-The suite contains 129 tests and requires no dependency installation. The action
-uses the Node 24 GitHub Actions runtime.
+The suite contains 148 tests and requires no dependency installation. The action
+is composite: `main.js` runs on Node 24 (pinned with `actions/setup-node`,
+which the `node24` runtime used to guarantee) and the report upload is
+`actions/upload-artifact`, both GitHub's own.
 
 Unit tests stub the `fetch` and child-process boundaries. What they cannot reach
 is proven elsewhere: the `Test` workflow's `smoke` job unpacks the real tarball,

@@ -75,6 +75,12 @@ const COMMENT_MARKER = '<!-- tea-test-review -->';
  */
 const MAX_INLINE_REPORT_CHARS = 40000;
 
+/**
+ * Cap on the file paths listed in the comment digest. Past this the list stops
+ * being a digest; the full manifest is in the report itself.
+ */
+const MAX_LISTED_REVIEWED_FILES = 10;
+
 const REQUEST_TIMEOUT_MS = 30_000;
 const COMMENT_RETRY_LIMIT = 3;
 
@@ -428,6 +434,18 @@ function outputsFromVerdict(verdict) {
   };
 }
 
+/** Only well-formed path strings; a malformed verdict must not break the comment. */
+function asPathList(files) {
+  return (Array.isArray(files) ? files : []).filter((f) => typeof f === 'string' && f.length > 0);
+}
+
+/** Up to MAX_LISTED_REVIEWED_FILES paths as bullets, then one overflow line. */
+function cappedPathBullets(files, indent = '') {
+  const bullets = files.slice(0, MAX_LISTED_REVIEWED_FILES).map((f) => `${indent}- \`${f}\``);
+  if (files.length > MAX_LISTED_REVIEWED_FILES) bullets.push(`${indent}- … and ${files.length - MAX_LISTED_REVIEWED_FILES} more`);
+  return bullets;
+}
+
 /**
  * Comment body, ported from cli/examples/pr-test-review.yml's github-script step
  * so both surfaces read identically.
@@ -438,7 +456,7 @@ function outputsFromVerdict(verdict) {
  * exists for, and the digest above it is the part you read to decide whether to
  * bother.
  */
-function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult }) {
+function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName }) {
   if (!verdict) {
     return [
       COMMENT_MARKER,
@@ -456,13 +474,16 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   // Without this branch the digest below renders a recommendation of "undefined"
   // and reads like a verdict.
   if (verdict.promptOnly) {
+    const files = asPathList(verdict.files);
     return [
       COMMENT_MARKER,
       '## TEA Test Review: no review performed',
       '',
       'The CLI ran with `--agent none`, so it built the prompt and stopped. This is a dry run, not a verdict.',
       '',
-      `Files that would have been reviewed: ${(verdict.files ?? []).length}.`,
+      `Files that would have been reviewed: ${files.length}.`,
+      ...cappedPathBullets(files),
+      '',
       `[Workflow run](${runUrl})`,
     ].join('\n');
   }
@@ -481,6 +502,9 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   const counts = verdict.violations ?? {};
   const violations = `${counts.critical ?? 0} Critical / ${counts.high ?? 0} High / ${counts.medium ?? 0} Medium / ${counts.low ?? 0} Low`;
   const weaknesses = (verdict.keyWeaknesses ?? []).slice(0, 3);
+  // Named, not just counted: a finding that cites "line 200" is unattributable
+  // on a pull request touching more than one test file.
+  const reviewed = asPathList(verdict.reviewedFiles);
 
   const lines = [
     COMMENT_MARKER,
@@ -489,7 +513,8 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
     `- **Quality score**: ${verdict.qualityScore ?? 'n/a'}/100`,
     `- **Recommendation**: ${verdict.recommendation}`,
     `- **Violations**: ${violations}`,
-    `- **Reviewed files**: ${(verdict.reviewedFiles ?? []).length}`,
+    `- **Reviewed files**: ${reviewed.length}`,
+    ...cappedPathBullets(reviewed, '  '),
   ];
 
   if (verdict.waived) {
@@ -506,11 +531,16 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   lines.push('');
 
   if (reportText && reportText.length <= MAX_INLINE_REPORT_CHARS) {
+    // A reviewed file's own content can contain a literal </details>; inserting
+    // a zero-width space breaks that as an HTML closing tag while leaving the
+    // visible text effectively unchanged, so it cannot end this block early and
+    // spill raw markdown into the rest of the comment.
+    const safeReportText = reportText.replace(/<\/details>/gi, '<\u200B/details>');
     lines.push(
       '<details>',
       '<summary>Full report (paste into your AI coding agent to apply the fixes)</summary>',
       '',
-      reportText,
+      safeReportText,
       '',
       '</details>',
       '',
@@ -520,12 +550,14 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
     const why = reportText
       ? `too large to inline (${reportText.length} characters, limit ${MAX_INLINE_REPORT_CHARS})`
       : 'not readable from the workspace';
-    lines.push(
-      `The full report is ${why}. It is in the workspace at \`${reportPath}\`; add an ` +
-        '`actions/upload-artifact` step to this job to download it.',
-      '',
-      `[Workflow run](${runUrl})`
-    );
+    // The artifact only helps when the report existed to be uploaded; an
+    // unreadable report is missing from both places.
+    const recovery =
+      reportText && artifactName
+        ? `It is uploaded as the \`${artifactName}\` artifact on the workflow run.`
+        : `It is in the workspace at \`${reportPath}\`, which the runner deletes when the job ends` +
+          (artifactName ? '.' : '; enable `upload-report` or add an `actions/upload-artifact` step to keep it.');
+    lines.push(`The full report is ${why}. ${recovery}`, '', `[Workflow run](${runUrl})`);
   }
 
   return lines.join('\n');
@@ -796,6 +828,7 @@ function buildOptions(env = process.env) {
       extraArgs: parseExtraArgs(getInput('extra-args', env)),
     },
     comment: getBooleanInput('comment', env),
+    uploadReport: getBooleanInput('upload-report', env),
     token: getInput('github-token', env),
     apiUrl: getInput('github-api-url', env) || 'https://api.github.com',
     workspace: env.GITHUB_WORKSPACE || process.cwd(),
@@ -827,6 +860,9 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     runUrl: workflowRunUrl(env),
     reportPath: opts.reportPath,
     reviewResult,
+    // The name the composite action's upload step uses; a test pins the two
+    // constructions to match, because the comment promises this artifact.
+    artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}` : null,
   });
 
   try {
@@ -919,6 +955,7 @@ module.exports = {
   AGENTS,
   COMMENT_MARKER,
   MAX_INLINE_REPORT_CHARS,
+  MAX_LISTED_REVIEWED_FILES,
   getInput,
   getBooleanInput,
   setOutput,
