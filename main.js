@@ -181,12 +181,12 @@ function parsePactMcp(raw) {
 }
 
 /**
- * Split extra-args the way a shell would, honouring single and double quotes so
- * a waiver reason can contain spaces. Deliberately not a shell: the tokens go
- * straight into an argv array, so no interpolation, globbing or command
- * substitution is possible from an input.
+ * Split an action argument-list input the way a shell would, honouring single
+ * and double quotes so one argument can contain spaces. Deliberately not a
+ * shell: the tokens go straight into an argv array, so no interpolation,
+ * globbing or command substitution is possible from an input.
  */
-function parseExtraArgs(raw) {
+function parseExtraArgs(raw, inputName = 'extra-args') {
   const s = String(raw == null ? '' : raw);
   const tokens = [];
   let current = '';
@@ -212,7 +212,7 @@ function parseExtraArgs(raw) {
     current += char;
     started = true;
   }
-  if (quote) throw new Error(`extra-args has an unterminated ${quote === '"' ? 'double' : 'single'} quote`);
+  if (quote) throw new Error(`${inputName} has an unterminated ${quote === '"' ? 'double' : 'single'} quote`);
   if (started) tokens.push(current);
   return tokens;
 }
@@ -358,6 +358,7 @@ function buildCliArgs(opts) {
   if (opts.agentCommand !== opts.cliAgent) args.push('--agent-cmd', opts.agentCommand);
   if (opts.envPass) args.push('--env-pass', opts.envPass);
   if (opts.model) args.push('--model', opts.model);
+  for (const arg of opts.agentArgs || []) args.push(`--agent-arg=${arg}`);
   if (opts.testDir) args.push('--test-dir', opts.testDir);
   if (opts.scope) args.push('--scope', opts.scope);
   if (opts.minScore) args.push('--min-score', opts.minScore);
@@ -816,6 +817,7 @@ function buildOptions(env = process.env) {
     jsonPath: getInput('json-path', env) || 'test-review.json',
     cli: {
       model: getInput('model', env),
+      agentArgs: parseExtraArgs(getInput('agent-args', env), 'agent-args'),
       testDir: getInput('test-dir', env),
       scope: getInput('scope', env),
       minScore: getInput('min-score', env),

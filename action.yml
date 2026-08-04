@@ -119,6 +119,16 @@ inputs:
       the rest of that argv.
     required: false
     default: ''
+  agent-args:
+    description: |
+      Shell-style argument list passed directly to the selected agent through
+      the review CLI's repeated --agent-arg option. Use this for vendor-specific
+      execution settings such as Codex `-c model_reasoning_effort=low`.
+
+      Requires a tea-version whose CLI understands --agent-arg. Arguments keep
+      their declared order and are forwarded to whichever agent is selected.
+    required: false
+    default: ''
 
   # ─── pinned versions ────────────────────────────────────────────────────────
   tea-version:
@@ -211,7 +221,8 @@ inputs:
     description: |
       Arguments appended to the tea-test-review command verbatim, for flags this
       action does not model: --files, --test-glob, --timeout-ms, --fail-on-skip,
-      --waive/--waive-until, --claude-arg, --isolate/--no-isolate, --env-pass.
+      --waive/--waive-until, --isolate/--no-isolate, --env-pass. Use agent-args
+      for selected-agent configuration.
       Quoted like a shell argument list, e.g.
       --waive "flaky suite, ticket FP-1234" --waive-until 2026-09-30
     required: false
@@ -321,6 +332,7 @@ runs:
         INPUT_AGENT-PACKAGE: ${{ inputs.agent-package }}
         INPUT_AGENT-COMMAND: ${{ inputs.agent-command }}
         INPUT_MODEL: ${{ inputs.model }}
+        INPUT_AGENT-ARGS: ${{ inputs.agent-args }}
         INPUT_TEA-VERSION: ${{ inputs.tea-version }}
         INPUT_CLAUDE-CODE-VERSION: ${{ inputs.claude-code-version }}
         INPUT_CODEX-VERSION: ${{ inputs.codex-version }}

@@ -132,6 +132,17 @@ defaults are aliases that follow the vendor's current model in that tier. The
 model that actually ran comes back in the verdict JSON as `model`, next to
 `agent`, because two scores are only comparable when both match.
 
+Selected-agent configuration goes through `agent-args`. The value is parsed as
+a shell-style argument list, then each token is forwarded in order through the
+review CLI's `--agent-arg` option. For a faster Codex review:
+
+```yaml
+with:
+  agent: codex
+  model: gpt-5.6-luna
+  agent-args: -c model_reasoning_effort=low
+```
+
 TEA config keys: `use-playwright-utils`, `use-pactjs-utils`, `pact-mcp`. Set
 `use-pactjs-utils: 'true'` in a repository that does contract testing:
 
@@ -157,10 +168,10 @@ with:
 ```
 
 That covers `--files`, `--test-glob`, `--timeout-ms`, `--fail-on-skip`,
-`--waive`/`--waive-until`, `--claude-arg`, `--isolate`/`--no-isolate` and
-`--env-pass`. Arguments land after the modelled flags, so `extra-args` wins on a
-repeated flag. The full flag reference is
-[`tea-test-review-cli.md`](https://github.com/muratkeremozcan/bmad-method-test-architecture-enterprise/blob/main/docs/reference/tea-test-review-cli.md).
+`--waive`/`--waive-until`, `--isolate`/`--no-isolate` and `--env-pass`.
+Arguments land after the modelled flags, so `extra-args` wins on a repeated
+flag. Use `agent-args` for selected-agent configuration. See the
+[full CLI flag reference](https://github.com/muratkeremozcan/bmad-method-test-architecture-enterprise/blob/main/docs/reference/tea-test-review-cli.md).
 
 ## Outputs
 

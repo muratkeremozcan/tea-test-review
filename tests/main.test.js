@@ -515,6 +515,18 @@ describe('buildCliArgs', () => {
     assert.strictEqual(args[args.indexOf('--model') + 1], 'opus[1m]');
   });
 
+  test('agent-args keep their order and use equals form for flag-shaped values', () => {
+    const args = action.buildCliArgs({
+      ...base,
+      agentArgs: ['--add-dir=/tmp', '-c', 'model_reasoning_effort=low'],
+    });
+    assert.deepStrictEqual(args.slice(-3), [
+      '--agent-arg=--add-dir=/tmp',
+      '--agent-arg=-c',
+      '--agent-arg=model_reasoning_effort=low',
+    ]);
+  });
+
   test('an empty model passes nothing, leaving the CLI\'s per-vendor pinned default in charge', () => {
     // Absent means "use the pinned default", never "let the vendor CLI decide":
     // that resolution lives in the CLI's adapter table, not here.
@@ -562,6 +574,11 @@ describe('action.yml defaults', () => {
   test('base-ref is declared empty and derived at runtime', () => {
     assert.strictEqual(declaredDefault('base-ref'), '');
     assert.strictEqual(buildWith({ GITHUB_BASE_REF: 'main' }).baseRef, 'origin/main');
+  });
+
+  test('agent-args are parsed as a shell-style argument list', () => {
+    const opts = buildWith({ 'INPUT_AGENT-ARGS': '-c "model_reasoning_effort=low"' });
+    assert.deepStrictEqual(opts.cli.agentArgs, ['-c', 'model_reasoning_effort=low']);
   });
 
   test("the three TEA config keys default to empty, so the CLI's own resolution stands", () => {
