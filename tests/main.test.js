@@ -1109,6 +1109,29 @@ describe('buildCommentBody', () => {
     assert.match(body, /<\/details>/);
   });
 
+  test('the digest names the agent and model, so two scores are comparable', () => {
+    const body = action.buildCommentBody({
+      verdict: { ...verdict, agent: 'codex', model: 'gpt-5.6-luna' },
+      reportText: '# report',
+      runUrl,
+    });
+    assert.match(body, /- \*\*Reviewer\*\*: codex \/ gpt-5\.6-luna/);
+  });
+
+  test('a verdict with no agent or model omits the reviewer line rather than printing undefined', () => {
+    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
+    assert.ok(!body.includes('**Reviewer**'));
+  });
+
+  test('the inlined report has its frontmatter fenced, so bookkeeping stops rendering as a heading', () => {
+    // The closing `---` is a setext underline, so an unfenced block renders the
+    // resume state larger than the report title directly beneath it.
+    const reportText = "---\nlastStep: 'step-04-generate-report'\nworkflowType: 'testarch-test-review'\n---\n\n# Test Quality Review\n";
+    const body = action.buildCommentBody({ verdict, reportText, runUrl });
+    assert.match(body, /```yaml\nlastStep: 'step-04-generate-report'\nworkflowType: 'testarch-test-review'\n```/);
+    assert.match(body, /# Test Quality Review/);
+  });
+
   test('a report containing a literal closing details tag cannot end the inline block early', () => {
     // The zero-width space breaks it as an HTML tag while leaving the visible
     // text unchanged; without it the rest of the report spills into the comment
@@ -1455,5 +1478,31 @@ describe('upsertComment', () => {
     const calls = stub([[{ id: 1, body: 'one' }]]);
     await action.upsertComment(ctx, 42, 'body');
     assert.strictEqual(calls.filter((call) => call.method === 'GET').length, 1);
+  });
+});
+
+describe('fenceLeadingFrontmatter', () => {
+  test('fences a leading frontmatter block and leaves the body untouched', () => {
+    const out = action.fenceLeadingFrontmatter("---\na: 1\nb: 2\n---\n\n# Title\n\ntext\n");
+    assert.strictEqual(out, "```yaml\na: 1\nb: 2\n```\n\n# Title\n\ntext\n");
+  });
+
+  test('a thematic break inside the body is not mistaken for frontmatter', () => {
+    const text = '# Title\n\n---\n\nsection\n';
+    assert.strictEqual(action.fenceLeadingFrontmatter(text), text);
+  });
+
+  test('an unclosed leading marker is left alone rather than half-fenced', () => {
+    const text = '---\na: 1\n\n# Title\n';
+    assert.strictEqual(action.fenceLeadingFrontmatter(text), text);
+  });
+
+  test('frontmatter containing a fence is left alone, so ours cannot end early', () => {
+    const text = '---\nnote: "```"\n---\n\n# Title\n';
+    assert.strictEqual(action.fenceLeadingFrontmatter(text), text);
+  });
+
+  test('a missing report is a string, not a crash', () => {
+    assert.strictEqual(action.fenceLeadingFrontmatter(null), '');
   });
 });

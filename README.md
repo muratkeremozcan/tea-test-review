@@ -15,35 +15,10 @@ when the caller requires an immutable dependency and deliberate upgrades.
 
 ## Installation
 
-```yaml
-name: TEA Test Review
+Copy one of the two [proven configurations](#proven-configurations) below. Both
+ran live end to end, so neither is an illustration.
 
-on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
-permissions: {}
-
-jobs:
-  review:
-    name: test review
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Forks receive no secrets, so the review cannot run for them. Read the fork
-    # caveat under "Important behavior" before making this a required check.
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    permissions:
-      contents: read
-      pull-requests: write # for the review comment
-    steps:
-      - uses: muratkeremozcan/tea-test-review@v1
-        with:
-          min-score: "80"
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-```
-
-Two things this workflow needs and will not work without:
+Two things any such workflow needs and will not work without:
 
 - `pull-requests: write`, when `comment` is left on.
 - A credential. Either `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, as the
@@ -269,14 +244,93 @@ Only the selected agent's credential is required. An unset secret resolves to
 empty and is ignored by the agent that does not use it, so a claude-only
 repository can leave `openai-api-key` out.
 
-## Making it a required check
+## Failing CI on a bad review
 
-Require the job by name in the branch ruleset. The step's exit code is the
-verdict: `0` passed, was skipped, or was waived; `1` is a verdict failure; `2`
-and `3` mean the gate could not produce a verdict at all.
+**It already does.** The CLI defaults to `--fail-on request-changes`, so a
+`Request Changes` or `Block` verdict exits the step non-zero and the job goes red
+with no configuration at all.
 
-Read the fork caveat first. A repository that accepts pull requests from forks
-cannot use this as its only protection.
+The comment is posted **before** the gate fails, so a red job never costs you the
+review. If you want the finding, read the comment; the exit code is only the
+verdict.
+
+| Exit | Meaning                                                                |
+| ---: | ---------------------------------------------------------------------- |
+|  `0` | Verdict passed, the review was skipped, or a failure was waived        |
+|  `1` | Verdict failure. The tests need work                                   |
+|  `2` | Environment or configuration error. **No review happened**             |
+|  `3` | Agent or report-parse failure. **No review happened**                  |
+
+`2` and `3` are not verdicts. The action says so in the log and in the comment,
+and never reports either as approved tests. Treat them as a broken gate, not as
+passing tests.
+
+### Choose how much the verdict blocks
+
+**Blocking, individually required.** Add the job to the branch ruleset by name.
+The most direct option, and the right one when this is your only quality gate.
+
+**Blocking through an aggregating gate.** If the repository already publishes one
+required status that waits on every workflow, this job needs no ruleset entry of
+its own: its red job fails that status, and that status blocks the merge. Verify
+this shape before adding a second required check you do not need.
+
+**Advisory.** `continue-on-error: true` on the job keeps a failing verdict a
+comment and never a red pipeline. Useful while a team is calibrating to the
+rubric, or when the test review rides along beside a code review that owns the
+gate. You give up enforcement completely: nothing stops a merge, so this is a
+reporting tool until you remove the line.
+
+```yaml
+jobs:
+  tea-review:
+    runs-on: ubuntu-latest
+    continue-on-error: true # advisory: verdict is a comment, never a red pipeline
+    steps:
+      - uses: muratkeremozcan/tea-test-review@v1
+        # ...
+```
+
+### Tune the strictness
+
+```yaml
+with:
+  fail-on: block # let Request Changes pass; fail only on Block
+  min-score: "80" # also fail below a score floor
+  min-files: "2" # also fail when the report reviewed fewer files than this
+```
+
+`min-score` and `min-files` are off unless set. `fail-on` is the exception: left
+empty, the CLI's own `request-changes` default applies, which is why this gate
+bites out of the box. `fail-on: block` is the loosest useful setting — the review
+still runs and still comments, and only a `Block` stops the merge.
+
+`min-files` counts the report's own manifest, not the diff, so it is an evidence
+floor: it catches a review that quietly scoped itself down to one file.
+
+**No setting lets a Critical finding pass.** A Critical violation means a test
+cannot fail or never reaches the code it claims to test, and the review derives
+`Block` for it, which fails at every `fail-on` level. `max-critical` can tighten
+the gate and never widen it. When you genuinely need to ship past one, use
+`--waive` through `extra-args`: it changes the exit code, is recorded in the
+verdict payload with its reason and expiry, and leaves the verdict itself intact
+so the finding stays visible.
+
+A pull request that changes no test file **skips and exits 0**, which a required
+check reads as passing. Read the `skipped` output to tell a skip from a pass, or
+pass `--fail-on-skip` through `extra-args` to make a skip fail instead.
+
+### Forks give no protection
+
+Fork pull requests get no secrets, so the review cannot run for them. This
+matters more than it looks: GitHub treats a skipped required check as passing, so
+a gate that skips on forks gives **zero** protection against external
+contributions. It is the contributions you trust least that go unreviewed.
+
+Guard the job with
+`if: github.event.pull_request.head.repo.full_name == github.repository` and pair
+the gate with something that does cover forks. Fork coverage needs a privileged
+design of its own, such as a `pull_request_target` workflow with strict controls.
 
 ## Artifacts
 
@@ -288,18 +342,10 @@ holds it. Opt out with `upload-report: 'false'` and manage artifacts yourself.
 
 ## Configuration
 
-Inputs and defaults are documented in [`action.yml`](action.yml). The ones worth
-knowing about:
-
-Gate policy, all optional and all off unless set: `min-score`, `max-critical`,
-`min-files`, `fail-on`.
-
-```yaml
-with:
-  min-score: "80"
-  max-critical: "0"
-  fail-on: block
-```
+Every input and default is documented in [`action.yml`](action.yml). This section
+covers only the ones with a consequence you would not guess. Gate policy
+(`fail-on`, `min-score`, `max-critical`, `min-files`) is in
+[Failing CI on a bad review](#failing-ci-on-a-bad-review).
 
 Review scope: `base-ref` (derived from the event, or through the pulls API on
 an `issue_comment` run, so a pull request into a release branch diffs against
@@ -361,7 +407,7 @@ That covers `--files`, `--test-glob`, `--timeout-ms`, `--fail-on-skip`,
 `--waive`/`--waive-until`, `--isolate`/`--no-isolate` and `--env-pass`.
 Arguments land after the modelled flags, so `extra-args` wins on a repeated
 flag. Use `agent-args` for selected-agent configuration. See the
-[full CLI flag reference](https://github.com/muratkeremozcan/bmad-method-test-architecture-enterprise/blob/main/docs/reference/tea-test-review-cli.md).
+[full CLI flag reference](https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise/blob/main/docs/reference/tea-test-review-cli.md).
 
 ## Outputs
 
@@ -378,7 +424,7 @@ flag. Use `agent-args` for selected-agent configuration. See the
 
 `agent` defaults to `claude`. `codex` is also built in and its full proven
 workflow is the second configuration above: the review CLI's own adapter table
-([`cli/lib/agent-adapters.js`](https://github.com/muratkeremozcan/bmad-method-test-architecture-enterprise/blob/main/cli/lib/agent-adapters.js))
+([`cli/lib/agent-adapters.js`](https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise/blob/main/cli/lib/agent-adapters.js))
 spawns it natively (`codex exec --sandbox workspace-write`), so this action
 passes `agent` straight through as `--agent` and installs `@openai/codex`,
 pinned by `codex-version`.
@@ -432,22 +478,6 @@ alone; only built-in vendors get the login step described above.
 
 ## Important behavior
 
-- **Fork pull requests get no secrets, so the review cannot run for them.** This
-  matters more than it looks: GitHub treats a skipped required check as passing,
-  so a gate that skips on forks gives zero protection against external
-  contributions. It is the contributions you trust least that go unreviewed.
-  Guard the job with
-  `if: github.event.pull_request.head.repo.full_name == github.repository` and
-  pair the gate with something that does cover forks. Fork coverage needs a
-  privileged design of its own, such as a `pull_request_target` workflow with
-  strict controls.
-- **Exit 2 and 3 are not verdicts.** Exit 1 means the tests need work. Exit 2 is
-  an environment or configuration error and exit 3 is an agent or report-parse
-  failure, and both mean no review happened. The action says so in the log and in
-  the comment, and never reports either as approved tests.
-- **A skip and a pass both exit 0.** A pull request that changes no test file
-  skips the review. Read the `skipped` output to tell them apart, or pass
-  `--fail-on-skip` through `extra-args` to make a skip fail instead.
 - **The reviewer never comes from the pull request.** The skill is unpacked from
   the pinned npm tarball into a temp directory outside the checkout and passed as
   `--skill-root`, so a pull request that edits its own vendored `_bmad/` copy
@@ -464,28 +494,20 @@ alone; only built-in vendors get the login step described above.
 - **The comment is upserted on a hidden marker**, so ten pushes update one
   comment instead of leaving ten. A comment that cannot be written is a warning
   and never changes the verdict, because the verdict is the step's exit code.
-- **`reviewed-files` counts the report's own manifest**, which is what
-  `--min-files` evaluates, and is not the number of files in the diff.
 - **A review takes minutes.** The CLI prints a heartbeat every 15 seconds and
   this action streams it straight through, so a live job shows progress rather
   than looking hung. Give the job a `timeout-minutes` that accommodates it.
 
 ## Releasing
 
-Releases use one workflow with a preparation phase and a promotion phase:
+**Actions → Release → Run workflow** on `main`, choose `patch`/`minor`/`major`.
+The workflow runs the unit suite and a consumer smoke, derives the `vX.Y.Z` tag,
+and drafts a release. Review the draft, tick **Publish this Action to the GitHub
+Marketplace**, publish. The publication job then moves the floating major tag
+(`v1`) to the same commit.
 
-1. Open **Actions → Release → Run workflow** on `main` and choose `patch`,
-   `minor`, or `major`.
-2. The workflow runs the unit suite and a deterministic consumer smoke, derives
-   the complete `vX.Y.Z` tag, and creates a draft release.
-3. Review the draft, select **Publish this Action to the GitHub Marketplace**,
-   and publish it.
-4. The publication job verifies the immutable exact release, then moves the
-   compatible floating tag such as `v1` to the same commit.
-
-New exact release tags become permanent when this workflow publishes them under
-repository immutability. Floating major tags never have GitHub releases attached
-because they must move to later compatible versions.
+Exact release tags are permanent under repository immutability. Floating major
+tags carry no GitHub release, because they have to move.
 
 ## Development
 
@@ -493,15 +515,12 @@ because they must move to later compatible versions.
 node --test tests/*.test.js
 ```
 
-The suite requires no dependency installation. The
-action is composite: `main.js` runs on Node 24 (pinned with
-`actions/setup-node`, which the `node24` runtime used to guarantee), the
-checkout is `actions/checkout`, and the report upload is
-`actions/upload-artifact` — all GitHub's own.
+No dependency installation. The action is composite: `main.js` on Node 24 pinned
+with `actions/setup-node`, plus `actions/checkout` and `actions/upload-artifact`
+— all GitHub's own.
 
 Unit tests stub the `fetch` and child-process boundaries. What they cannot reach
-is proven elsewhere: the `Test` workflow's `smoke` job unpacks the real tarball,
-installs the pinned CLI, runs a live review against this repository's own test
-file, and writes a real PR comment twice to prove the second run updates rather
-than duplicates. That job detects a missing credential and reports that it was
-skipped, so it does not go red on a repository that has not added one.
+is covered by the `Test` workflow's `smoke` job, which unpacks the real tarball,
+installs the pinned CLI, reviews this repository's own test file, and comments
+twice to prove the second run updates rather than duplicates. It reports itself
+skipped rather than red when no credential is present.

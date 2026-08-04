@@ -449,6 +449,30 @@ function cappedPathBullets(files, indent = '') {
 }
 
 /**
+ * Fence the report's leading YAML frontmatter so it renders as small monospace
+ * text instead of a heading.
+ *
+ * The report opens with `---\nkey: value\n---`. Markdown reads the closing `---`
+ * as a setext underline for the lines above it, so the whole resume-state block
+ * renders as an <h2>: the largest, boldest text in the comment is workflow
+ * bookkeeping, sitting directly above the actual report title. Fencing it keeps
+ * the block verbatim for the paste-into-your-agent path while dropping it to
+ * code-block size.
+ *
+ * Only a frontmatter block at the very start is touched, and only when it
+ * closes; a report whose body contains `---` thematic breaks is left alone.
+ */
+function fenceLeadingFrontmatter(reportText) {
+  const text = String(reportText ?? '');
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/.exec(text);
+  if (!match) return text;
+  // A frontmatter value containing a fence would end ours early and spill the
+  // rest of the report out of the block, so back off rather than corrupt it.
+  if (match[1].includes('```')) return text;
+  return `\`\`\`yaml\n${match[1]}\n\`\`\`${match[2]}${text.slice(match[0].length)}`;
+}
+
+/**
  * Comment body, ported from cli/examples/pr-test-review.yml's github-script step
  * so both surfaces read identically.
  *
@@ -532,6 +556,15 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
     ...cappedPathBullets(reviewed, '  '),
   ];
 
+  // A score with no attribution cannot be compared to another score. The CLI
+  // already puts the resolved agent and model in the verdict JSON for exactly
+  // that reason; without this line the human surface loses it, and 82 from one
+  // vendor reads as interchangeable with 82 from another.
+  const reviewer = [verdict.agent, verdict.model].filter((v) => typeof v === 'string' && v.length > 0);
+  if (reviewer.length > 0) {
+    lines.push(`- **Reviewer**: ${reviewer.join(' / ')}`);
+  }
+
   if (verdict.waived) {
     lines.push(
       `- **Waived**: ${verdict.waiveReason ?? 'no reason recorded'} (until ${verdict.waiveUntil ?? 'unspecified'})`
@@ -550,7 +583,7 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
     // a zero-width space breaks that as an HTML closing tag while leaving the
     // visible text effectively unchanged, so it cannot end this block early and
     // spill raw markdown into the rest of the comment.
-    const safeReportText = reportText.replace(/<\/details>/gi, '<\u200B/details>');
+    const safeReportText = fenceLeadingFrontmatter(reportText).replace(/<\/details>/gi, '<\u200B/details>');
     lines.push(
       '<details>',
       '<summary>Full report (paste into your AI coding agent to apply the fixes)</summary>',
@@ -1171,6 +1204,7 @@ module.exports = {
   COMMENT_MARKER,
   MAX_INLINE_REPORT_CHARS,
   MAX_LISTED_REVIEWED_FILES,
+  fenceLeadingFrontmatter,
   getInput,
   getBooleanInput,
   setOutput,
