@@ -10,7 +10,9 @@ It packages what used to be a ~230-line workflow copied into every repository:
 pin and unpack the review skill from an npm tarball, install the pinned CLI and
 agent, run `tea-test-review`, then comment. One step replaces both jobs.
 
-Always pin the action to a full commit SHA.
+Always pin the action to a full commit SHA. There is no tag or release yet, so
+the proven configurations below track `@main`, which is what the author's own
+repositories run; a SHA is the stronger pin everywhere else.
 
 ## Installation
 
@@ -35,22 +37,15 @@ jobs:
       contents: read
       pull-requests: write # for the review comment
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # the review diffs changed test files against the base ref
-          persist-credentials: false
-
       - uses: muratkeremozcan/tea-test-review@<sha>
         with:
-          min-score: '80'
+          min-score: "80"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-Three things this workflow needs and will not work without:
+Two things this workflow needs and will not work without:
 
-- `fetch-depth: 0`. The review set comes from a git diff against the base ref,
-  and a shallow checkout has no base ref to diff against.
 - `pull-requests: write`, when `comment` is left on.
 - A credential. Either `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, as the
   step's `env:` above or as the `anthropic-api-key` / `claude-code-oauth-token`
@@ -58,13 +53,15 @@ Three things this workflow needs and will not work without:
   `CLAUDE_CODE_OAUTH_TOKEN` is a long-lived token minted from an existing Claude
   subscription with `claude setup-token`, with no separate API billing.
 
-Node 22 or newer is installed on GitHub-hosted runners already, so no
-`setup-node` step is required.
+There is no checkout step on purpose: the action checks out the code itself —
+full history, the PR's merge commit — so the review always diffs the right
+tree. Node 22 or newer is installed on GitHub-hosted runners already, so no
+`setup-node` step is required either.
 
 ### `tea-version` has to be a version that ships the CLI
 
 `bmad-method-test-architecture-enterprise@1.20.0` is the first release that does.
-Every earlier version publishes the review *skill* and declares an empty `bin`,
+Every earlier version publishes the review _skill_ and declares an empty `bin`,
 and npm versions are immutable, so those will not gain it later.
 
 The default is `latest`, so a fresh caller gets a release that ships the CLI
@@ -77,8 +74,198 @@ Pin an exact version when you want the verdict to be reproducible:
 
 ```yaml
 with:
-  tea-version: '1.20.0'
+  tea-version: "1.20.0"
 ```
+
+## Proven configurations
+
+Both workflows below ran live against real pull requests, end to end: install,
+review, gate exit code, upserted PR comment, uploaded artifact. They are shown
+verbatim; the job skeleton is identical and only the `with:` block differs.
+Both predate the action's built-in checkout, so their `actions/checkout` steps
+are redundant today — harmless, but new installs should not add one.
+
+### Claude
+
+The workflow that reviewed a private TypeScript repository whose tests live
+under `scripts/`:
+
+```yaml
+name: TEA Test Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Deny-all baseline for GITHUB_TOKEN. Not the same as omitting the key, which
+# falls back to the repository default; each job opts back in below.
+permissions: {}
+
+jobs:
+  review:
+    name: test review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Forks receive no secrets, so the review cannot run for them.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write # for the review comment
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the review diffs changed test files against the base ref
+          persist-credentials: false
+
+      - uses: muratkeremozcan/tea-test-review@main
+        with:
+          agent: claude
+          model: claude-sonnet-4-6
+          anthropic-api-key: ${{ secrets.CLAUDE_REVIEW_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          use-playwright-utils: "true"
+          use-pactjs-utils: "true"
+```
+
+- `CLAUDE_REVIEW_TOKEN` is only the secret's name in that repository; any
+  Anthropic Console key works. The `anthropic-api-key` input and an
+  `ANTHROPIC_API_KEY` env on the step are interchangeable.
+- `github-token` is spelled out for readability; it equals the default.
+- `use-playwright-utils` and `use-pactjs-utils` are stated rather than left to
+  resolve. CI installs the skill from a tarball, so no `_bmad/tea/config.yaml`
+  exists, and an unstated key is one the agent settles per run: identical
+  files then get reviewed against different knowledge.
+
+### Codex
+
+The file that gated
+[couture-cast#101](https://github.com/muratkeremozcan/couture-cast/pull/101).
+codex reviewed a deliberately poor API spec, returned `Request Changes` with
+76/100, grade C, and the step exited 1, which is the gate working, not the
+integration failing:
+
+```yaml
+name: TEA Test Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Deny-all baseline for GITHUB_TOKEN. Not the same as omitting the key, which
+# falls back to the repository default; each job opts back in below.
+permissions: {}
+
+jobs:
+  review:
+    name: test review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Forks receive no secrets, so the review cannot run for them.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write # for the review comment
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the review diffs changed test files against the base ref
+          persist-credentials: false
+
+      - uses: muratkeremozcan/tea-test-review@main
+        with:
+          agent: codex
+          model: gpt-5.6-luna
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          use-playwright-utils: "true"
+          use-pactjs-utils: "true"
+          agent-args: -c model_reasoning_effort=low
+```
+
+- codex needs two setup steps claude does not, and the action performs both:
+  the `codex login --with-api-key` pipe and the Linux user-namespace fix, both
+  described under "Other agents".
+- `agent-args: -c model_reasoning_effort=low` is a Codex-only knob, forwarded
+  through the review CLI's `--agent-arg`. Measured locally it cuts a full
+  review from ~10 minutes to ~3.5; the gated run above finished in about a
+  minute.
+- No `test-dir`: it is only a hint to the skill, the review set always comes
+  from the pull-request diff, and this repository's tests live under
+  `playwright/tests`.
+
+Both pin `model` as a fully-qualified slug rather than the review CLI's alias
+defaults (`sonnet`, `gpt-5.6-sol`): a verdict stays attributable to one model
+generation, and the slug that ran is recorded in the verdict JSON next to
+`agent`.
+
+## Trigger the review from a PR comment
+
+`mode` and `prompt` are the whole surface. `mode: auto` (the default) is what
+the recipes above do: every pull request, plus a mention comment when the
+workflow also triggers on `issue_comment`. `mode: manual` reviews only when
+asked — `pull_request` events skip cleanly. Either way the mention picks the
+agent, and whatever the requester wrote after it becomes the review's focus:
+
+    @codex focus on the retry paths
+
+```yaml
+name: TEA Test Review
+
+on:
+  pull_request: # delete this block for mention-only reviews
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  review:
+    name: test review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The fork guard is only for the pull_request path; the mention path is
+    # gated inside the action.
+    if: github.event_name == 'issue_comment' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write # for the review comment
+    steps:
+      - uses: muratkeremozcan/tea-test-review@<sha>
+        with:
+          prompt: "@claude @codex"
+          agent: codex
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+```
+
+- **The mention picks the agent.** `@codex` runs codex, `@claude` runs claude,
+  and a mention naming no built-in vendor keeps the `agent` input. A mention
+  that switches vendors resets `model` and `agent-args` to the selected
+  vendor's pinned defaults, because the configured values belong to the
+  configured vendor and would not parse. `pull_request` runs always use the
+  `agent` input.
+- **Text after the mention is the review's focus.** It reaches the reviewer
+  verbatim as a focus note: it may raise scrutiny on what it names and can
+  never waive a finding. The report quotes it as a `**Focus**:` line, so a
+  score states what steered it. This needs a tea-version whose CLI understands
+  `--focus`; on an older one the run fails with an unknown-option error. If
+  the PR changed no test files the review still skips — a focus note does not
+  invent a review set — but the skip comment quotes what you asked for and
+  says what changed instead, so the mention never reads as unheard.
+- **The authorization bar is enforced by the action, not your YAML.** Only a
+  comment from an OWNER, MEMBER or COLLABORATOR — never a bot — on a pull
+  request triggers the review; anything else skips cleanly with no comment
+  posted. An `issue_comment` run executes with the base repository's secrets
+  and checks out the PR's code, so that gate is what stands between a stranger
+  and your API key on a public repository.
+- **Checkout and base ref are handled.** On an `issue_comment` run the action
+  checks out the PR's merge ref itself and resolves the base branch through
+  the pulls API. Do not add a checkout step.
+
+Only the selected agent's credential is required. An unset secret resolves to
+empty and is ignored by the agent that does not use it, so a claude-only
+repository can leave `openai-api-key` out.
 
 ## Making it a required check
 
@@ -107,13 +294,14 @@ Gate policy, all optional and all off unless set: `min-score`, `max-critical`,
 
 ```yaml
 with:
-  min-score: '80'
-  max-critical: '0'
+  min-score: "80"
+  max-critical: "0"
   fail-on: block
 ```
 
-Review scope: `base-ref` (derived from the event, so a pull request into a
-release branch diffs against that branch), `test-dir`, `scope`.
+Review scope: `base-ref` (derived from the event, or through the pulls API on
+an `issue_comment` run, so a pull request into a release branch diffs against
+that branch), `test-dir`, `scope`.
 
 Which model reviews: `model`. Left empty the review CLI applies its own
 per-vendor pinned default (`claude`: `sonnet`, `codex`: `gpt-5.6-sol`), so a run
@@ -148,7 +336,7 @@ TEA config keys: `use-playwright-utils`, `use-pactjs-utils`, `pact-mcp`. Set
 
 ```yaml
 with:
-  use-pactjs-utils: 'true'
+  use-pactjs-utils: "true"
   pact-mcp: mcp
 ```
 
@@ -175,37 +363,38 @@ flag. Use `agent-args` for selected-agent configuration. See the
 
 ## Outputs
 
-| Output | Value |
-| --- | --- |
-| `recommendation` | `Approve`, `Approve with Comments`, `Request Changes` or `Block`. Empty on a skip. |
-| `quality-score` | Score out of 100. Empty on a skip. |
-| `critical`, `high`, `medium`, `low` | Violation counts. |
-| `reviewed-files` | How many files the report says it reviewed. |
-| `skipped` | `true` when there were no changed test files. |
-| `report-path`, `json-path` | Workspace-relative paths of the report and verdict. |
+| Output                              | Value                                                                              |
+| ----------------------------------- | ---------------------------------------------------------------------------------- |
+| `recommendation`                    | `Approve`, `Approve with Comments`, `Request Changes` or `Block`. Empty on a skip. |
+| `quality-score`                     | Score out of 100. Empty on a skip.                                                 |
+| `critical`, `high`, `medium`, `low` | Violation counts.                                                                  |
+| `reviewed-files`                    | How many files the report says it reviewed.                                        |
+| `skipped`                           | `true` when there were no changed test files.                                      |
+| `report-path`, `json-path`          | Workspace-relative paths of the report and verdict.                                |
 
 ## Other agents
 
-`agent` defaults to `claude`. `codex` is also built in and proven by a live
-run: the review CLI's own adapter table
+`agent` defaults to `claude`. `codex` is also built in and its full proven
+workflow is the second configuration above: the review CLI's own adapter table
 ([`cli/lib/agent-adapters.js`](https://github.com/muratkeremozcan/bmad-method-test-architecture-enterprise/blob/main/cli/lib/agent-adapters.js))
 spawns it natively (`codex exec --sandbox workspace-write`), so this action
 passes `agent` straight through as `--agent` and installs `@openai/codex`,
-pinned by `codex-version`:
+pinned by `codex-version`.
 
-```yaml
-with:
-  agent: codex
-  openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-```
-
-codex needs one thing claude does not, and this action does it for you: codex
-0.146.0 never reads `OPENAI_API_KEY` from the environment and authenticates
-only from `~/.codex/auth.json`, which no runner has. Handed only the variable,
-it sends no credential at all and the run dies on `401 ... Missing bearer or
-basic authentication in header`. So before running the review, the action pipes
-your key into `codex login --with-api-key` on stdin, never argv, so the
-credential reaches disk without reaching the workflow log.
+codex needs two things claude does not, and this action does both for you.
+First, authentication: codex 0.146.0 never reads `OPENAI_API_KEY` from the
+environment and authenticates only from `~/.codex/auth.json`, which no runner
+has. Handed only the variable, it sends no credential at all and the run dies
+on `401 ... Missing bearer or basic authentication in header`. So before
+running the review, the action pipes your key into `codex login
+--with-api-key` on stdin, never argv, so the credential reaches disk without
+reaching the workflow log. Second, its sandbox: on GitHub-hosted Linux, codex
+isolates itself with bubblewrap, which needs unprivileged user namespaces that
+Ubuntu 24.04 restricts, and without them every codex command fails with
+`loopback: Failed RTM_NEWADDR`. The action enables them
+(`kernel.unprivileged_userns_clone=1`,
+`kernel.apparmor_restrict_unprivileged_userns=0`) before installing anything,
+and skips that step on any other OS or a self-hosted runner.
 
 Any other value is a genuinely custom vendor and needs `agent-package`, and
 usually `agent-command` and `agent-key-env`, so adding one needs no change
@@ -214,7 +403,7 @@ here:
 ```yaml
 with:
   agent: gemini
-  agent-package: '@google/gemini-cli@0.5.0'
+  agent-package: "@google/gemini-cli@0.5.0"
   agent-command: gemini
   agent-key-env: GEMINI_API_KEY
   agent-api-key: ${{ secrets.GEMINI_API_KEY }}
@@ -285,10 +474,11 @@ alone; only built-in vendors get the login step described above.
 node --test tests/*.test.js
 ```
 
-The suite contains 148 tests and requires no dependency installation. The action
-is composite: `main.js` runs on Node 24 (pinned with `actions/setup-node`,
-which the `node24` runtime used to guarantee) and the report upload is
-`actions/upload-artifact`, both GitHub's own.
+The suite contains 176 tests and requires no dependency installation. The
+action is composite: `main.js` runs on Node 24 (pinned with
+`actions/setup-node`, which the `node24` runtime used to guarantee), the
+checkout is `actions/checkout`, and the report upload is
+`actions/upload-artifact` — all GitHub's own.
 
 Unit tests stub the `fetch` and child-process boundaries. What they cannot reach
 is proven elsewhere: the `Test` workflow's `smoke` job unpacks the real tarball,
