@@ -23,6 +23,11 @@ description: |
   The only actions it uses are GitHub's own setup-node, checkout and
   upload-artifact.
 
+author: muratkeremozcan
+branding:
+  icon: 'coffee'
+  color: 'green'
+
 inputs:
   # ─── trigger ────────────────────────────────────────────────────────────────
   mode:
