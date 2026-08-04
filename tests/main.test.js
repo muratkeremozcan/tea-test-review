@@ -640,6 +640,18 @@ describe('action.yml defaults', () => {
     assert.match(ACTION_YML, /uses: actions\/setup-node@v4\n      with:\n        node-version: '24'/);
   });
 
+  test('GitHub-hosted Linux enables the user namespaces Codex bubblewrap needs', () => {
+    const setupIndex = ACTION_YML.indexOf('- name: Enable Linux user namespaces for Codex');
+    const reviewIndex = ACTION_YML.indexOf('- name: Run the review');
+    assert.ok(setupIndex > 0 && setupIndex < reviewIndex, 'sandbox prerequisite must run before the review');
+    assert.match(
+      ACTION_YML,
+      /if: \$\{\{ inputs\.agent == 'codex' && runner\.os == 'Linux' && runner\.environment == 'github-hosted' \}\}/,
+    );
+    assert.match(ACTION_YML, /sudo sysctl -w kernel\.unprivileged_userns_clone=1/);
+    assert.match(ACTION_YML, /sudo sysctl -w kernel\.apparmor_restrict_unprivileged_userns=0/);
+  });
+
   test('every declared input reaches main.js as an INPUT_ variable', () => {
     // Composite run steps get no automatic INPUT_* env, so an input declared
     // but not mapped is silently always its default.
