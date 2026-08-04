@@ -361,6 +361,7 @@ function buildCliArgs(opts) {
   for (const arg of opts.agentArgs || []) args.push(`--agent-arg=${arg}`);
   if (opts.testDir) args.push('--test-dir', opts.testDir);
   if (opts.scope) args.push('--scope', opts.scope);
+  if (opts.focus) args.push('--focus', opts.focus);
   if (opts.minScore) args.push('--min-score', opts.minScore);
   if (opts.maxCritical) args.push('--max-critical', opts.maxCritical);
   if (opts.minFiles) args.push('--min-files', opts.minFiles);
@@ -457,7 +458,7 @@ function cappedPathBullets(files, indent = '') {
  * exists for, and the digest above it is the part you read to decide whether to
  * bother.
  */
-function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName }) {
+function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName, focus }) {
   if (!verdict) {
     return [
       COMMENT_MARKER,
@@ -490,14 +491,27 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   }
 
   if (verdict.skipped) {
-    return [
-      COMMENT_MARKER,
-      '## TEA Test Review: skipped',
-      '',
-      `${verdict.reason ?? 'No changed test files in this PR'}.`,
-      '',
-      `[Workflow run](${runUrl})`,
-    ].join('\n');
+    // The context set travels in the skipped payload, so the comment can say
+    // what the PR DID change. And when the run came from a mention with focus
+    // text, the skip must acknowledge it: silently dropping the requester's
+    // words reads as if the mention was never heard.
+    const contextCount = Array.isArray(verdict.contextFiles) ? verdict.contextFiles.length : 0;
+    const changed = contextCount > 0 ? ` (${contextCount} other file${contextCount === 1 ? '' : 's'} changed)` : '';
+    const lines = [COMMENT_MARKER, '## TEA Test Review: skipped', '', `${verdict.reason ?? 'No changed test files in this PR'}${changed}.`];
+    if (focus) {
+      lines.push(
+        '',
+        'You asked me to focus on:',
+        '',
+        ...String(focus)
+          .split('\n')
+          .map((line) => `> ${line}`),
+        '',
+        'There were no tests in scope to apply that to.'
+      );
+    }
+    lines.push('', `[Workflow run](${runUrl})`);
+    return lines.join('\n');
   }
 
   const counts = verdict.violations ?? {};
@@ -783,11 +797,180 @@ function readEventPayload(env = process.env) {
   return env.GITHUB_EVENT_PATH ? readJsonIfPresent(env.GITHUB_EVENT_PATH) : null;
 }
 
+/**
+ * Base ref when neither the caller nor the event stated one. A pull_request
+ * run always sets GITHUB_BASE_REF; an issue_comment run on a pull request does
+ * not, and the origin/main resolveBaseRef falls back to would then diff
+ * against the wrong base and review files the PR never touched. The pulls API
+ * is the only honest source left, and when it cannot answer the run fails
+ * rather than reviewing the wrong set: pass base-ref explicitly to bypass the
+ * lookup.
+ */
+async function resolveRunBaseRef({ baseRef, token, apiUrl }, payload, env = process.env) {
+  const stated = getInput('base-ref', env) !== '' || String(env.GITHUB_BASE_REF || '').trim() !== '';
+  if (stated) return baseRef;
+
+  const prNumber = resolvePrNumber(payload, env);
+  if (prNumber == null) return baseRef;
+
+  const guidance = 'Pass base-ref explicitly to bypass the lookup.';
+  const repo = parseRepository(env);
+  if (!repo || !token) {
+    throw new Error(
+      `cannot resolve the base branch of #${prNumber}: GITHUB_BASE_REF is empty and there is no usable ` +
+        'github-token. An issue_comment run carries no base ref, and guessing origin/main could review files ' +
+        `the pull request never touched. ${guidance}`
+    );
+  }
+
+  let pr;
+  try {
+    pr = await githubRequest({ apiUrl, token, method: 'GET', path: `/repos/${repo.owner}/${repo.repo}/pulls/${prNumber}` });
+  } catch (err) {
+    throw new Error(`cannot resolve the base branch of #${prNumber} from the GitHub API: ${err.message}. ${guidance}`);
+  }
+  const base = pr && pr.base && typeof pr.base.ref === 'string' ? pr.base.ref.trim() : '';
+  if (base === '') {
+    throw new Error(`the GitHub API returned no base ref for #${prNumber}. ${guidance}`);
+  }
+  log(`Base ref for #${prNumber} resolved through the API: origin/${base}`);
+  return `origin/${base}`;
+}
+
+// ─── trigger resolution ───────────────────────────────────────────────────────
+
+/**
+ * Comment authors trusted to spend the repository's secrets on a review. An
+ * issue_comment run executes with the base repository's secrets and checks
+ * out the pull request's code, so this list is the whole security model on a
+ * public repository. CONTRIBUTORS and below are deliberately absent.
+ */
+const MENTION_TRUSTED_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
+function parseMode(raw) {
+  const mode = String(raw == null ? '' : raw).trim().toLowerCase() || 'auto';
+  if (mode !== 'auto' && mode !== 'manual') {
+    throw new Error(`mode must be auto or manual, got "${raw}"`);
+  }
+  return mode;
+}
+
+/** Space-separated trigger list. Any token matches; @-mentions are convention, not law. */
+function parseMentions(raw) {
+  return String(raw == null ? '' : raw)
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
+ * Longest focus note the review accepts. A PR comment can run to tens of
+ * thousands of characters; the note travels verbatim in the prompt, so it is
+ * capped here, before it can become the largest thing the agent reads.
+ */
+const MAX_FOCUS_LENGTH = 1000;
+
+/**
+ * Index of the first boundary-valid occurrence of the mention, or -1.
+ * Word-delimited on BOTH sides and case-sensitive: '@claude' fires on
+ * '@claude,' but not on '@claude-alt', 'team@claude', or '@Claude'. An
+ * occurrence that fails the boundary check does not hide a later valid one.
+ */
+function mentionIndex(body, mention) {
+  const boundary = (ch) => ch === undefined || !/[A-Za-z0-9_-]/.test(ch);
+  let index = body.indexOf(mention);
+  while (index !== -1) {
+    if (boundary(body[index - 1]) && boundary(body[index + mention.length])) return index;
+    index = body.indexOf(mention, index + 1);
+  }
+  return -1;
+}
+
+/**
+ * First matching mention in CONFIGURATION order (not the earliest occurrence
+ * in the comment): the prompt list is the priority order.
+ */
+function matchMention(commentBody, mentions) {
+  const body = String(commentBody || '');
+  return mentions.find((mention) => mentionIndex(body, mention) !== -1) || null;
+}
+
+/**
+ * Whatever the requester wrote after the mention is the review's focus note,
+ * taken after the same boundary-valid occurrence the matcher accepted and
+ * capped at MAX_FOCUS_LENGTH.
+ */
+function extractFocus(commentBody, mention) {
+  const body = String(commentBody || '');
+  const index = mentionIndex(body, mention);
+  return index === -1 ? '' : body.slice(index + mention.length).trim().slice(0, MAX_FOCUS_LENGTH);
+}
+
+/** A mention that names a built-in vendor selects that agent; anything else keeps the agent input. */
+function agentForMention(mention, agents = AGENTS) {
+  const key = String(mention || '').replace(/^@/, '');
+  return Object.hasOwn(agents, key) ? key : null;
+}
+
+/**
+ * Whether this event triggers a review, and on whose terms.
+ *
+ * auto runs on pull_request (and any non-comment event, the historical
+ * behavior) and on a mention comment; manual runs only on a mention comment.
+ * A mention that names a built-in vendor selects that vendor's agent for the
+ * run, and the run then carries that vendor's pinned defaults rather than the
+ * configured vendor's model and agent-args, which would not even parse.
+ *
+ * The authorization bar lives here rather than in caller YAML because a
+ * copy-pasted `if:` is one more surface that drifts: an issue_comment run
+ * executes with the base repository's secrets and checks out the PR's code,
+ * so who may trigger it is not a per-repo decision.
+ */
+function resolveTrigger({ mode, mentions, agentInput, payload, eventName }) {
+  if (mode === 'manual' && mentions.length === 0) {
+    throw new Error('mode is manual but prompt is empty: nothing would ever trigger the review.');
+  }
+
+  const skip = (reason) => ({ proceed: false, reason });
+
+  if (eventName === 'pull_request') {
+    return mode === 'auto'
+      ? { proceed: true, via: 'pull_request', agent: agentInput, agentSwitched: false, focus: '' }
+      : skip('mode is manual: pull_request events do not trigger the review (comment a mention on the PR instead)');
+  }
+
+  if (eventName !== 'issue_comment') {
+    return mode === 'auto'
+      ? { proceed: true, via: eventName || 'event', agent: agentInput, agentSwitched: false, focus: '' }
+      : skip(`mode is manual: ${eventName || 'this'} events do not trigger the review`);
+  }
+
+  if (mentions.length === 0) return skip('no prompt mentions are configured');
+  if (!payload?.issue?.pull_request) return skip('the comment is not on a pull request');
+  if (payload?.comment?.user?.type === 'Bot') return skip('bot comments do not trigger the review');
+  const body = payload?.comment?.body || '';
+  const mention = matchMention(body, mentions);
+  if (!mention) return skip(`the comment contains none of the configured mentions (${mentions.join(', ')})`);
+  const association = payload?.comment?.author_association || '';
+  if (!MENTION_TRUSTED_ASSOCIATIONS.includes(association)) {
+    return skip(`comment author association "${association || 'NONE'}" is not one of ${MENTION_TRUSTED_ASSOCIATIONS.join(', ')}`);
+  }
+  const mentionAgent = agentForMention(mention);
+  const agent = mentionAgent || agentInput;
+  return {
+    proceed: true,
+    via: 'mention',
+    agent,
+    agentSwitched: Boolean(mentionAgent && mentionAgent !== agentInput),
+    focus: extractFocus(body, mention),
+    mention,
+  };
+}
+
 // ─── orchestration ────────────────────────────────────────────────────────────
 
-function buildOptions(env = process.env) {
+function buildOptions(env = process.env, { agentOverride = '', agentSwitched = false, focus = '' } = {}) {
   const agent = resolveAgent({
-    agent: getInput('agent', env),
+    agent: agentOverride || getInput('agent', env),
     agentPackage: getInput('agent-package', env),
     agentCommand: getInput('agent-command', env),
     agentKeyEnv: getInput('agent-key-env', env),
@@ -816,8 +999,12 @@ function buildOptions(env = process.env) {
     reportPath: getInput('report-path', env) || 'test-review.md',
     jsonPath: getInput('json-path', env) || 'test-review.json',
     cli: {
-      model: getInput('model', env),
-      agentArgs: parseExtraArgs(getInput('agent-args', env), 'agent-args'),
+      // A mention that switched vendors resets the per-vendor knobs: the
+      // configured model and agent-args belong to the configured agent and
+      // would not even parse on the one the mention selected.
+      model: agentSwitched ? '' : getInput('model', env),
+      agentArgs: agentSwitched ? [] : parseExtraArgs(getInput('agent-args', env), 'agent-args'),
+      focus,
       testDir: getInput('test-dir', env),
       scope: getInput('scope', env),
       minScore: getInput('min-score', env),
@@ -862,6 +1049,7 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     runUrl: workflowRunUrl(env),
     reportPath: opts.reportPath,
     reviewResult,
+    focus: opts.cli?.focus,
     // The name the composite action's upload step uses; a test pins the two
     // constructions to match, because the comment promises this artifact.
     artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}` : null,
@@ -883,10 +1071,35 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
 }
 
 async function run() {
-  const opts = buildOptions();
+  const payload = readEventPayload();
+  const trigger = resolveTrigger({
+    mode: parseMode(getInput('mode')),
+    mentions: parseMentions(getInput('prompt')),
+    agentInput: getInput('agent') || 'claude',
+    payload,
+    eventName: process.env.GITHUB_EVENT_NAME,
+  });
+  if (!trigger.proceed) {
+    notice(`TEA Test Review not triggered: ${trigger.reason}.`);
+    setOutput('skipped', 'true');
+    return 0;
+  }
+
+  const opts = buildOptions(process.env, {
+    agentOverride: trigger.agent,
+    agentSwitched: trigger.agentSwitched,
+    focus: trigger.focus,
+  });
+  opts.baseRef = await resolveRunBaseRef(opts, payload);
 
   log(`TEA Test Review: ${TEA_PACKAGE}@${opts.teaVersion}, agent ${opts.agent.key} (${opts.agent.packageSpec})`);
   log(`  base ref: ${opts.baseRef}, credential: ${opts.credential.name}`);
+  if (trigger.via === 'mention') {
+    log(`  triggered by a "${trigger.mention}" comment${trigger.focus ? `, focus: ${trigger.focus}` : ''}`);
+  }
+  if (trigger.agentSwitched) {
+    log(`  the mention selected ${trigger.agent}: model and agent-args reset to that vendor's pinned defaults`);
+  }
   if (!opts.agent.verified) {
     warn(
       `Agent "${opts.agent.key}" is not a built-in vendor. It runs as --agent claude --agent-cmd ${opts.agent.command}, ` +
@@ -963,6 +1176,15 @@ module.exports = {
   setOutput,
   binaryName,
   resolveBaseRef,
+  resolveRunBaseRef,
+  MENTION_TRUSTED_ASSOCIATIONS,
+  MAX_FOCUS_LENGTH,
+  parseMode,
+  parseMentions,
+  matchMention,
+  extractFocus,
+  agentForMention,
+  resolveTrigger,
   parseTriState,
   parsePactMcp,
   parseExtraArgs,

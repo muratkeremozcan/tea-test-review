@@ -87,6 +87,272 @@ describe('resolveBaseRef', () => {
   });
 });
 
+describe('resolveRunBaseRef', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const ok = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) });
+  const err = (status) => ({ ok: false, status, json: async () => null, text: async () => 'boom' });
+  const opts = { baseRef: 'origin/main', token: 't', apiUrl: 'https://api.github.com' };
+
+  test('a base ref stated by the caller or the event never touches the API', async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ok({});
+    };
+    const payload = { issue: { number: 7 } };
+    assert.strictEqual(await action.resolveRunBaseRef(opts, payload, { GITHUB_BASE_REF: 'release/2.0' }), 'origin/main');
+    assert.strictEqual(await action.resolveRunBaseRef(opts, payload, { 'INPUT_BASE-REF': 'origin/9.x' }), 'origin/main');
+    assert.strictEqual(calls, 0);
+  });
+
+  test('no pull request in context keeps the origin/main guess, so push runs are unchanged', async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ok({});
+    };
+    assert.strictEqual(await action.resolveRunBaseRef(opts, null, {}), 'origin/main');
+    assert.strictEqual(calls, 0);
+  });
+
+  test('an issue_comment run resolves the PR base through the pulls API', async () => {
+    let seen;
+    global.fetch = async (url) => {
+      seen = url;
+      return ok({ base: { ref: 'release/2.0' } });
+    };
+    const resolved = await action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' });
+    assert.strictEqual(resolved, 'origin/release/2.0');
+    assert.strictEqual(seen, 'https://api.github.com/repos/o/r/pulls/7');
+  });
+
+  test('an API failure fails loudly instead of diffing against the wrong base', async () => {
+    global.fetch = async () => err(404);
+    await assert.rejects(
+      action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
+      /Pass base-ref explicitly/
+    );
+  });
+
+  test('a missing token fails loudly for the same reason', async () => {
+    await assert.rejects(
+      action.resolveRunBaseRef({ ...opts, token: '' }, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
+      /Pass base-ref explicitly/
+    );
+  });
+
+  test('a response without a base ref fails loudly', async () => {
+    global.fetch = async () => ok({});
+    await assert.rejects(
+      action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
+      /no base ref/
+    );
+  });
+});
+
+describe('parseMode and parseMentions', () => {
+  test('mode defaults to auto and rejects anything else', () => {
+    assert.strictEqual(action.parseMode(''), 'auto');
+    assert.strictEqual(action.parseMode(undefined), 'auto');
+    assert.strictEqual(action.parseMode('manual'), 'manual');
+    assert.throws(() => action.parseMode('sometimes'), /mode must be auto or manual/);
+  });
+
+  test('mentions split on whitespace and drop empties', () => {
+    assert.deepStrictEqual(action.parseMentions('@claude @codex'), ['@claude', '@codex']);
+    assert.deepStrictEqual(action.parseMentions('  @tea   review  '), ['@tea', 'review']);
+    assert.deepStrictEqual(action.parseMentions(''), []);
+  });
+});
+
+describe('mention matching, focus, and agent selection', () => {
+  test('the first configured mention in the comment wins', () => {
+    assert.strictEqual(action.matchMention('please @codex this one', ['@claude', '@codex']), '@codex');
+    assert.strictEqual(action.matchMention('@claude and @codex', ['@claude', '@codex']), '@claude');
+    assert.strictEqual(action.matchMention('nothing here', ['@claude']), null);
+  });
+
+  test('matching is word-delimited and case-sensitive: @claude-alt and @Claude do not fire @claude', () => {
+    assert.strictEqual(action.matchMention('@claude-alt look', ['@claude']), null);
+    assert.strictEqual(action.matchMention('@Claude look', ['@claude']), null);
+    assert.strictEqual(action.matchMention('@claude, look', ['@claude']), '@claude');
+    assert.strictEqual(action.matchMention('@claude', ['@claude']), '@claude');
+    // Leading boundary too: a mention embedded directly after a word character
+    // (an email local part, a username) is not a trigger.
+    assert.strictEqual(action.matchMention('team@claude look', ['@claude']), null);
+    assert.strictEqual(action.matchMention('write to user@claude.com', ['@claude']), null);
+    // An occurrence that fails the boundary check does not hide a later valid one.
+    assert.strictEqual(action.matchMention('team@claude, then @claude for real', ['@claude']), '@claude');
+  });
+
+  test('focus is whatever the requester wrote after the mention', () => {
+    assert.strictEqual(action.extractFocus('@codex focus on the retry paths', '@codex'), 'focus on the retry paths');
+    assert.strictEqual(action.extractFocus('@codex', '@codex'), '');
+    assert.strictEqual(action.extractFocus('hey @claude\n\nlook at auth', '@claude'), 'look at auth');
+    // Sliced after the boundary-valid occurrence the matcher accepted, not an
+    // earlier embedded one.
+    assert.strictEqual(action.extractFocus('team@codex no, @codex do this', '@codex'), 'do this');
+  });
+
+  test('focus is capped at MAX_FOCUS_LENGTH, so a giant comment cannot dominate the prompt', () => {
+    const focus = action.extractFocus(`@claude ${'x'.repeat(action.MAX_FOCUS_LENGTH + 500)}`, '@claude');
+    assert.strictEqual(focus.length, action.MAX_FOCUS_LENGTH);
+  });
+
+  test('a mention naming a built-in vendor selects it; anything else keeps the input', () => {
+    assert.strictEqual(action.agentForMention('@claude'), 'claude');
+    assert.strictEqual(action.agentForMention('@codex'), 'codex');
+    assert.strictEqual(action.agentForMention('@tea'), null);
+  });
+});
+
+describe('resolveTrigger', () => {
+  const mentions = ['@claude', '@codex'];
+  const commentOnPr = (body, association = 'MEMBER', userType = 'User') => ({
+    issue: { number: 7, pull_request: {} },
+    comment: { body, author_association: association, user: { type: userType } },
+  });
+
+  test('pull_request runs in auto with the configured agent and no focus', () => {
+    const t = action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'codex', payload: {}, eventName: 'pull_request' });
+    assert.deepStrictEqual(t, { proceed: true, via: 'pull_request', agent: 'codex', agentSwitched: false, focus: '' });
+  });
+
+  test('pull_request skips in manual: the mention is the only way in', () => {
+    const t = action.resolveTrigger({ mode: 'manual', mentions, agentInput: 'claude', payload: {}, eventName: 'pull_request' });
+    assert.strictEqual(t.proceed, false);
+    assert.match(t.reason, /manual/);
+  });
+
+  test('manual with an empty prompt is a config error, not a silent never-run', () => {
+    assert.throws(
+      () => action.resolveTrigger({ mode: 'manual', mentions: [], agentInput: 'claude', payload: {}, eventName: 'pull_request' }),
+      /prompt is empty/
+    );
+  });
+
+  test('issue_comment skips when no mentions are configured', () => {
+    const t = action.resolveTrigger({ mode: 'auto', mentions: [], agentInput: 'claude', payload: commentOnPr('@claude'), eventName: 'issue_comment' });
+    assert.strictEqual(t.proceed, false);
+  });
+
+  test('issue_comment skips on a plain issue, a bot comment, and a mention-less comment', () => {
+    assert.strictEqual(
+      action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: { issue: { number: 7 }, comment: { body: '@claude' } }, eventName: 'issue_comment' }).proceed,
+      false
+    );
+    assert.strictEqual(
+      action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: commentOnPr('@claude', 'MEMBER', 'Bot'), eventName: 'issue_comment' }).proceed,
+      false
+    );
+    assert.strictEqual(
+      action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: commentOnPr('lgtm'), eventName: 'issue_comment' }).proceed,
+      false
+    );
+  });
+
+  test('a mention from an untrusted association skips: the gate is the security model', () => {
+    for (const association of ['CONTRIBUTOR', 'FIRST_TIME_CONTRIBUTOR', 'FIRST_TIMER', 'NONE']) {
+      const t = action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: commentOnPr('@claude', association), eventName: 'issue_comment' });
+      assert.strictEqual(t.proceed, false, association);
+      assert.match(t.reason, /association/, association);
+    }
+    for (const association of action.MENTION_TRUSTED_ASSOCIATIONS) {
+      assert.strictEqual(
+        action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: commentOnPr('@claude', association), eventName: 'issue_comment' }).proceed,
+        true,
+        association
+      );
+    }
+  });
+
+  test('a @codex mention switches the agent and carries the focus text', () => {
+    const t = action.resolveTrigger({
+      mode: 'auto',
+      mentions,
+      agentInput: 'claude',
+      payload: commentOnPr('@codex focus on the retry paths'),
+      eventName: 'issue_comment',
+    });
+    assert.deepStrictEqual(t, {
+      proceed: true,
+      via: 'mention',
+      agent: 'codex',
+      agentSwitched: true,
+      focus: 'focus on the retry paths',
+      mention: '@codex',
+    });
+  });
+
+  test('a mention naming no built-in vendor keeps the configured agent', () => {
+    const t = action.resolveTrigger({
+      mode: 'auto',
+      mentions: ['@tea'],
+      agentInput: 'codex',
+      payload: commentOnPr('@tea please'),
+      eventName: 'issue_comment',
+    });
+    assert.strictEqual(t.proceed, true);
+    assert.strictEqual(t.agent, 'codex');
+    assert.strictEqual(t.agentSwitched, false);
+  });
+
+  test('push and dispatch events keep the historical behavior: auto runs, manual skips', () => {
+    assert.strictEqual(
+      action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: null, eventName: 'push' }).proceed,
+      true
+    );
+    assert.strictEqual(
+      action.resolveTrigger({ mode: 'manual', mentions, agentInput: 'claude', payload: null, eventName: 'push' }).proceed,
+      false
+    );
+  });
+});
+
+describe('buildOptions trigger overrides', () => {
+  const baseEnv = { INPUT_AGENT: 'claude', 'INPUT_ANTHROPIC-API-KEY': 'sk-test' };
+
+  test('an agent override wins over the agent input', () => {
+    const opts = action.buildOptions({ ...baseEnv, 'INPUT_OPENAI-API-KEY': 'sk-oai' }, { agentOverride: 'codex' });
+    assert.strictEqual(opts.agent.key, 'codex');
+  });
+
+  test('a vendor switch resets the per-vendor knobs, because they would not parse on the new agent', () => {
+    const opts = action.buildOptions(
+      { ...baseEnv, 'INPUT_OPENAI-API-KEY': 'sk-oai', INPUT_MODEL: 'claude-sonnet-4-6', 'INPUT_AGENT-ARGS': '--verbose' },
+      { agentOverride: 'codex', agentSwitched: true }
+    );
+    assert.strictEqual(opts.cli.model, '');
+    assert.deepStrictEqual(opts.cli.agentArgs, []);
+  });
+
+  test('without a switch the configured model and agent-args stand', () => {
+    const opts = action.buildOptions({ ...baseEnv, INPUT_MODEL: 'claude-sonnet-4-6' }, { agentOverride: 'claude', agentSwitched: false });
+    assert.strictEqual(opts.cli.model, 'claude-sonnet-4-6');
+  });
+
+  test('focus travels into the CLI args as --focus', () => {
+    const opts = action.buildOptions(baseEnv, { focus: 'look at auth' });
+    assert.strictEqual(opts.cli.focus, 'look at auth');
+    const args = action.buildCliArgs({
+      ...opts.cli,
+      baseRef: 'origin/main',
+      skillRoot: '/tmp/skill',
+      reportPath: 'r.md',
+      jsonPath: 'r.json',
+      cliAgent: 'claude',
+      agentCommand: 'claude',
+      envPass: '',
+    });
+    const index = args.indexOf('--focus');
+    assert.ok(index !== -1 && args[index + 1] === 'look at auth', args.join(' '));
+  });
+});
+
 describe('parseTriState', () => {
   test("empty means 'let the CLI resolve it', which is not false", () => {
     // false forces --no-use-pactjs-utils; null passes nothing and lets
@@ -903,6 +1169,35 @@ describe('buildCommentBody', () => {
   test('a skip with no reason still reads as a skip', () => {
     const body = action.buildCommentBody({ verdict: { skipped: true }, runUrl });
     assert.match(body, /No changed test files in this PR\./);
+  });
+
+  test('a skip says what the PR changed instead, when the context set is known', () => {
+    const body = action.buildCommentBody({
+      verdict: { skipped: true, reason: 'no changed test files in diff', contextFiles: ['src/a.ts', 'src/b.ts'] },
+      runUrl,
+    });
+    assert.match(body, /no changed test files in diff \(2 other files changed\)\./);
+    assert.ok(!body.includes('You asked me to focus on'));
+  });
+
+  test('a mention-triggered skip acknowledges the focus, so the requester knows they were heard', () => {
+    const body = action.buildCommentBody({
+      verdict: { skipped: true, reason: 'no changed test files in diff', contextFiles: ['src/auth/login.ts'] },
+      focus: 'what about the retry handling',
+      runUrl,
+    });
+    assert.match(body, /\(1 other file changed\)/);
+    assert.match(body, /You asked me to focus on:\n\n> what about the retry handling\n/);
+    assert.match(body, /There were no tests in scope to apply that to\./);
+  });
+
+  test('a multi-line focus quotes every line', () => {
+    const body = action.buildCommentBody({
+      verdict: { skipped: true },
+      focus: 'look at auth\nand the retries',
+      runUrl,
+    });
+    assert.match(body, /> look at auth\n> and the retries\n/);
   });
 
   test('an --agent none dry run says no review happened, rather than a verdict of undefined', () => {

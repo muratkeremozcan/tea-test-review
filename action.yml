@@ -20,9 +20,44 @@ description: |
 
   Zero dependencies: no node_modules to audit, no bundle step, and no
   third-party JavaScript between a pull request and the verdict that blocks it.
-  The only actions it uses are GitHub's own setup-node and upload-artifact.
+  The only actions it uses are GitHub's own setup-node, checkout and
+  upload-artifact.
 
 inputs:
+  # ─── trigger ────────────────────────────────────────────────────────────────
+  mode:
+    description: |
+      When the review runs. 'auto' (the default): every pull_request event,
+      plus any comment containing a `prompt` mention when the workflow also
+      triggers on issue_comment. 'manual': only a mention comment triggers the
+      review; pull_request and every other event skip cleanly. A skip is exit
+      0 with the `skipped` output set, never a failure.
+    required: false
+    default: 'auto'
+  prompt:
+    description: |
+      Space-separated mention list that triggers the review from a PR comment,
+      e.g. '@claude @codex'. Matching is case-sensitive and word-delimited on
+      both sides ('@claude' fires on '@claude,' but not on '@claude-alt' or
+      'team@claude'), and the first matching mention in configuration order
+      wins. A mention naming a built-in vendor (@claude, @codex) selects that
+      agent for the run; any other mention keeps the `agent` input. When the
+      mention switches the agent, `model` and `agent-args` reset to the
+      selected vendor's pinned defaults, because both are per-vendor and the
+      configured values would not parse.
+
+      Only a comment from an OWNER, MEMBER or COLLABORATOR — never a bot — can
+      trigger the review. An issue_comment run executes with the base
+      repository's secrets and checks out the PR's code, so this gate is what
+      stands between a stranger and your API key on a public repository. Text
+      after the mention is handed to the reviewer as a focus note, capped at
+      1000 characters (requires a tea-version whose CLI understands --focus).
+
+      Requires the workflow to trigger on issue_comment, and the action's own
+      checkout lands the PR's merge ref for those runs.
+    required: false
+    default: ''
+
   # ─── agent and credentials ──────────────────────────────────────────────────
   agent:
     description: |
@@ -160,8 +195,12 @@ inputs:
   base-ref:
     description: |
       Git ref the changed-test diff is taken against. Defaults to
-      origin/<the PR base branch> when this runs on a pull_request event, and
-      origin/main otherwise. Needs a full-history checkout (fetch-depth: 0).
+      origin/<the PR base branch>: read from GITHUB_BASE_REF on a pull_request
+      event, and resolved through the pulls API on an issue_comment run, which
+      carries no base ref of its own. When neither source can answer (a push
+      or dispatch run), origin/main is assumed. A failed API lookup fails the
+      step rather than diffing against the wrong base; set this input to
+      bypass the lookup. Needs a full-history checkout (fetch-depth: 0).
     required: false
     default: ''
   test-dir:
@@ -314,6 +353,34 @@ runs:
       with:
         node-version: '24'
 
+    # Owned so the caller never writes the ref expression: an issue_comment
+    # run starts on the default branch, and the review there would judge the
+    # wrong tree. github.sha is the merge commit on pull_request and the
+    # triggering commit everywhere else. clean: false so work an earlier step
+    # left in the workspace survives. Skipped on a plain-issue comment: no
+    # refs/pull/<n>/merge exists for one, and main.js reports the skip.
+    - name: Check out the code under review
+      id: checkout
+      if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
+      # A merge-conflicted PR has no merge ref; on issue_comment that failure
+      # falls through to the head-ref step below rather than failing the job.
+      continue-on-error: ${{ github.event_name == 'issue_comment' }}
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || github.sha }}
+        fetch-depth: 0 # the review diffs changed test files against the base ref
+        persist-credentials: false
+        clean: false
+
+    - name: Fall back to the PR head when the merge ref does not exist
+      if: ${{ steps.checkout.outcome == 'failure' }}
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ format('refs/pull/{0}/head', github.event.issue.number) }}
+        fetch-depth: 0
+        persist-credentials: false
+        clean: false
+
     # Codex uses bubblewrap on Linux. GitHub-hosted Ubuntu 24.04 restricts the
     # user namespace bubblewrap needs and otherwise fails every command with
     # `loopback: Failed RTM_NEWADDR`.
@@ -342,6 +409,8 @@ runs:
       shell: bash
       run: node "$GITHUB_ACTION_PATH/main.js"
       env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_PROMPT: ${{ inputs.prompt }}
         INPUT_AGENT: ${{ inputs.agent }}
         INPUT_ANTHROPIC-API-KEY: ${{ inputs.anthropic-api-key }}
         INPUT_CLAUDE-CODE-OAUTH-TOKEN: ${{ inputs.claude-code-oauth-token }}
