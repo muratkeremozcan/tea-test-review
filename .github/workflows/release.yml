@@ -158,6 +158,8 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       major: ${{ steps.release.outputs.major }}
       release-sha: ${{ steps.release.outputs.release-sha }}
+      highest-tag: ${{ steps.release.outputs.highest-tag }}
+      release-order: ${{ steps.release.outputs.release-order }}
     steps:
       - name: Check out the published release
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -205,9 +207,24 @@ jobs:
 
           gh api "repos/$GITHUB_REPOSITORY/contents/action.yml?ref=$TAG" --jq .sha >/dev/null
 
+          highest_tag=$(gh api \
+            --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | awk -v prefix="$major." 'index($0, prefix) == 1' \
+            | node scripts/release-version.js latest)
+          release_order=$(node scripts/release-version.js compare "$TAG" "$highest_tag")
+
+          if [ "$release_order" -lt 0 ]; then
+            echo "$TAG is older than the highest published $major release, $highest_tag." >&2
+            exit 1
+          fi
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "major=$major" >> "$GITHUB_OUTPUT"
           echo "release-sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "highest-tag=$highest_tag" >> "$GITHUB_OUTPUT"
+          echo "release-order=$release_order" >> "$GITHUB_OUTPUT"
 
       - name: Run unit tests
         run: node --test tests/*.test.js
@@ -232,7 +249,7 @@ jobs:
             if curl --fail --silent --show-error --location --max-time 30 \
               --output "$marketplace_page" \
               'https://github.com/marketplace/actions/tea-test-review' \
-              && grep --fixed-strings --quiet "$TAG" "$marketplace_page"; then
+              && grep --fixed-strings --word-regexp --quiet "$TAG" "$marketplace_page"; then
               exit 0
             fi
             sleep 5
@@ -253,12 +270,56 @@ jobs:
       - name: Move the floating major tag
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
           MAJOR: ${{ needs.verify.outputs.major }}
           RELEASE_SHA: ${{ needs.verify.outputs.release-sha }}
+          HIGHEST_TAG: ${{ needs.verify.outputs.highest-tag }}
+          RELEASE_ORDER: ${{ needs.verify.outputs.release-order }}
         run: |
           set -euo pipefail
 
+          if [ "$RELEASE_ORDER" -lt 0 ]; then
+            echo "$TAG is older than the highest published $MAJOR release, $HIGHEST_TAG. $MAJOR stays put." >&2
+            exit 1
+          fi
+
+          resolve_tag_commit() {
+            local ref_name="$1"
+            local object_type object_sha
+
+            read -r object_type object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$ref_name" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+
+            while [ "$object_type" = 'tag' ]; do
+              read -r object_type object_sha < <(
+                gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )
+            done
+
+            if [ "$object_type" != 'commit' ]; then
+              echo "Tag $ref_name resolves to $object_type instead of a commit." >&2
+              return 1
+            fi
+
+            printf '%s\n' "$object_sha"
+          }
+
+          exact_sha=$(resolve_tag_commit "$TAG")
+          if [ "$exact_sha" != "$RELEASE_SHA" ]; then
+            echo "$TAG resolves to $exact_sha instead of $RELEASE_SHA." >&2
+            exit 1
+          fi
+
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR" >/dev/null 2>&1; then
+            major_sha=$(resolve_tag_commit "$MAJOR")
+            if [ "$major_sha" = "$RELEASE_SHA" ]; then
+              echo "$MAJOR already resolves to $RELEASE_SHA." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
             gh api \
               --method PATCH \
               "repos/$GITHUB_REPOSITORY/git/refs/tags/$MAJOR" \
@@ -281,8 +342,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          exact_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)
-          major_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR" --jq .object.sha)
+          resolve_tag_commit() {
+            local ref_name="$1"
+            local object_type object_sha
+
+            read -r object_type object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$ref_name" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+
+            while [ "$object_type" = 'tag' ]; do
+              read -r object_type object_sha < <(
+                gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )
+            done
+
+            if [ "$object_type" != 'commit' ]; then
+              echo "Tag $ref_name resolves to $object_type instead of a commit." >&2
+              return 1
+            fi
+
+            printf '%s\n' "$object_sha"
+          }
+
+          exact_sha=$(resolve_tag_commit "$TAG")
+          major_sha=$(resolve_tag_commit "$MAJOR")
 
           test "$exact_sha" = "$RELEASE_SHA"
           test "$major_sha" = "$RELEASE_SHA"

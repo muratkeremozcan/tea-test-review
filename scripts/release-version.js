@@ -2,6 +2,7 @@
 
 const STABLE_TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const BUMPS = new Set(['patch', 'minor', 'major']);
+const BASELINE_TAG = 'v0.0.0';
 
 function parseStableTag(tag) {
   const match = STABLE_TAG.exec(String(tag));
@@ -57,7 +58,7 @@ function compareVersionTags(leftTag, rightTag) {
 function latestVersionTag(tags) {
   const valid = tags.filter((tag) => STABLE_TAG.test(String(tag)));
   if (valid.length === 0) {
-    throw new Error('no stable vX.Y.Z release exists to bump');
+    return BASELINE_TAG;
   }
 
   return valid.sort(compareVersionTags).at(-1);
@@ -79,11 +80,15 @@ function runCli(argv, stdin = '') {
     return majorTag(first);
   }
 
+  if (command === 'compare' && first && second) {
+    return String(Math.sign(compareVersionTags(first, second)));
+  }
+
   if (command === 'latest' && first === undefined) {
     return latestVersionTag(stdin.split(/\r?\n/).filter(Boolean));
   }
 
-  throw new Error('usage: release-version.js validate <vX.Y.Z> | next <vX.Y.Z> <patch|minor|major> | major <vX.Y.Z> | latest < tags.txt');
+  throw new Error('usage: release-version.js validate <vX.Y.Z> | next <vX.Y.Z> <patch|minor|major> | major <vX.Y.Z> | compare <vX.Y.Z> <vX.Y.Z> | latest < tags.txt');
 }
 
 if (require.main === module) {
