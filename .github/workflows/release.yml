@@ -1,0 +1,295 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Stable version component to bump
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: tea-test-review-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: prepare draft
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      release-sha: ${{ github.sha }}
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+
+      - name: Require the default branch
+        run: |
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            echo "Run releases from main, got $GITHUB_REF." >&2
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: node --test tests/*.test.js
+
+      # This exercises the composite action, npm pack and install, real CLI
+      # invocation, report parsing, and output mapping without paying for an
+      # agent call. The placeholder credential is never sent anywhere because
+      # the final CLI argument selects the no-agent prompt-generation mode.
+      - name: Run deterministic consumer smoke
+        uses: ./
+        with:
+          anthropic-api-key: release-smoke-no-agent
+          comment: 'false'
+          upload-report: 'false'
+          min-files: '1'
+          extra-args: --agent none --files tests/main.test.js
+
+      - name: Derive the next exact version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+
+          current_tag=$(gh api \
+            --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | node scripts/release-version.js latest)
+
+          tag=$(node scripts/release-version.js next "$current_tag" "$BUMP")
+          echo "current-tag=$current_tag" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  draft:
+    name: create draft
+    if: github.event_name == 'workflow_dispatch'
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create the exact tag and draft release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release-sha }}
+        run: |
+          set -euo pipefail
+
+          created_tag=false
+          if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
+            existing_sha=$(jq -r '.object.sha' <<< "$ref")
+            if [ "$existing_sha" != "$RELEASE_SHA" ]; then
+              echo "Tag $TAG already points to $existing_sha instead of $RELEASE_SHA." >&2
+              exit 1
+            fi
+          else
+            gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" \
+              -f sha="$RELEASE_SHA" >/dev/null
+            created_tag=true
+          fi
+
+          if release=$(gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,url 2>/dev/null); then
+            if [ "$(jq -r '.isDraft' <<< "$release")" != 'true' ]; then
+              echo "Release $TAG already exists and is published." >&2
+              exit 1
+            fi
+
+            url=$(jq -r '.url' <<< "$release")
+            echo "Existing draft release: $url" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! url=$(gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --generate-notes \
+            --title "$TAG"); then
+            if [ "$created_tag" = 'true' ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" || true
+            fi
+            exit 1
+          fi
+
+          echo "Draft release: $url" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Review it, select Publish this Action to the GitHub Marketplace, then publish.' >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: verify published release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      major: ${{ steps.release.outputs.major }}
+      release-sha: ${{ steps.release.outputs.release-sha }}
+    steps:
+      - name: Check out the published release
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+
+      # Validate the ref against main before executing any repository code.
+      - name: Validate the immutable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must match vX.Y.Z, got $TAG." >&2
+            exit 1
+          fi
+
+          major="${TAG%%.*}"
+          release_sha=$(git rev-list -n 1 "$TAG")
+
+          git fetch --no-tags origin +main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$release_sha" origin/main; then
+            echo "Release $TAG points outside main: $release_sha" >&2
+            exit 1
+          fi
+
+          node scripts/release-version.js validate "$TAG" >/dev/null
+          test "$(node scripts/release-version.js major "$TAG")" = "$major"
+
+          immutable=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)
+          if [ "$immutable" != 'true' ]; then
+            echo "Release $TAG is mutable. Enable immutable releases before promotion." >&2
+            exit 1
+          fi
+
+          gh api "repos/$GITHUB_REPOSITORY/contents/action.yml?ref=$TAG" --jq .sha >/dev/null
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "release-sha=$release_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        run: node --test tests/*.test.js
+
+      - name: Run deterministic consumer smoke
+        uses: ./
+        with:
+          anthropic-api-key: release-smoke-no-agent
+          comment: 'false'
+          upload-report: 'false'
+          min-files: '1'
+          extra-args: --agent none --files tests/main.test.js
+
+      - name: Verify Marketplace publication
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          marketplace_page="$RUNNER_TEMP/tea-test-review-marketplace.html"
+          for attempt in $(seq 1 24); do
+            if curl --fail --silent --show-error --location --max-time 30 \
+              --output "$marketplace_page" \
+              'https://github.com/marketplace/actions/tea-test-review' \
+              && grep --fixed-strings --quiet "$TAG" "$marketplace_page"; then
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Marketplace does not list $TAG. Confirm the release checkbox was selected." >&2
+          exit 1
+
+  promote:
+    name: promote floating major
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Move the floating major tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAJOR: ${{ needs.verify.outputs.major }}
+          RELEASE_SHA: ${{ needs.verify.outputs.release-sha }}
+        run: |
+          set -euo pipefail
+
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR" >/dev/null 2>&1; then
+            gh api \
+              --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/tags/$MAJOR" \
+              -f sha="$RELEASE_SHA" \
+              -F force=true >/dev/null
+          else
+            gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$MAJOR" \
+              -f sha="$RELEASE_SHA" >/dev/null
+          fi
+
+      - name: Verify exact and floating references
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          MAJOR: ${{ needs.verify.outputs.major }}
+          RELEASE_SHA: ${{ needs.verify.outputs.release-sha }}
+        run: |
+          set -euo pipefail
+
+          exact_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)
+          major_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR" --jq .object.sha)
+
+          test "$exact_sha" = "$RELEASE_SHA"
+          test "$major_sha" = "$RELEASE_SHA"
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/contents/action.yml?ref=$MAJOR" --jq .sha >/dev/null
+          curl --fail --silent --show-error --location --max-time 30 \
+            "https://github.com/$GITHUB_REPOSITORY/tree/$MAJOR" >/dev/null
+
+          echo "$TAG and $MAJOR both resolve to $RELEASE_SHA." >> "$GITHUB_STEP_SUMMARY"

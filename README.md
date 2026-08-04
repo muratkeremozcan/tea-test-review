@@ -10,9 +10,8 @@ It packages what used to be a ~230-line workflow copied into every repository:
 pin and unpack the review skill from an npm tarball, install the pinned CLI and
 agent, run `tea-test-review`, then comment. One step replaces both jobs.
 
-Always pin the action to a full commit SHA. There is no tag or release yet, so
-the proven configurations below track `@main`, which is what the author's own
-repositories run; a SHA is the stronger pin everywhere else.
+Use `@v1` for the latest backwards-compatible v1 release. Pin a full commit SHA
+when the caller requires an immutable dependency and deliberate upgrades.
 
 ## Installation
 
@@ -37,7 +36,7 @@ jobs:
       contents: read
       pull-requests: write # for the review comment
     steps:
-      - uses: muratkeremozcan/tea-test-review@<sha>
+      - uses: muratkeremozcan/tea-test-review@v1
         with:
           min-score: "80"
         env:
@@ -471,13 +470,30 @@ alone; only built-in vendors get the login step described above.
   this action streams it straight through, so a live job shows progress rather
   than looking hung. Give the job a `timeout-minutes` that accommodates it.
 
+## Releasing
+
+Releases use one workflow with a preparation phase and a promotion phase:
+
+1. Open **Actions → Release → Run workflow** on `main` and choose `patch`,
+   `minor`, or `major`.
+2. The workflow runs the unit suite and a deterministic consumer smoke, derives
+   the complete `vX.Y.Z` tag, and creates a draft release.
+3. Review the draft, select **Publish this Action to the GitHub Marketplace**,
+   and publish it.
+4. The publication job verifies the immutable exact release, then moves the
+   compatible floating tag such as `v1` to the same commit.
+
+New exact release tags become permanent when this workflow publishes them under
+repository immutability. Floating major tags never have GitHub releases attached
+because they must move to later compatible versions.
+
 ## Development
 
 ```bash
 node --test tests/*.test.js
 ```
 
-The suite contains 176 tests and requires no dependency installation. The
+The suite requires no dependency installation. The
 action is composite: `main.js` runs on Node 24 (pinned with
 `actions/setup-node`, which the `node24` runtime used to guarantee), the
 checkout is `actions/checkout`, and the report upload is
