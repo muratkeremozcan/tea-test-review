@@ -16,6 +16,7 @@ const {
 
 const CLI = path.join(__dirname, '..', 'scripts', 'release-version.js');
 const RELEASE_WORKFLOW = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'release.yml'), 'utf8');
+const DRAFT_JOB = RELEASE_WORKFLOW.slice(RELEASE_WORKFLOW.indexOf('  draft:'), RELEASE_WORKFLOW.indexOf('  verify:'));
 
 describe('release version tags', () => {
   test('parses a stable action release tag', () => {
@@ -152,10 +153,12 @@ describe('release workflow contract', () => {
     assert.match(RELEASE_WORKFLOW, /major_sha=\$\(resolve_tag_commit "\$MAJOR"\)/);
   });
 
-  test('creates releases from the exact tag and never the floating major', () => {
-    assert.match(RELEASE_WORKFLOW, /gh release create "\$TAG"/);
-    assert.match(RELEASE_WORKFLOW, /--target "\$RELEASE_SHA"/);
-    assert.doesNotMatch(RELEASE_WORKFLOW, /--verify-tag/);
+  test('creates the exact tag before its release and never releases the floating major', () => {
+    const tagCreation = DRAFT_JOB.indexOf('-f ref="refs/tags/$TAG"');
+    const releaseCreation = DRAFT_JOB.indexOf('gh release create "$TAG"');
+
+    assert.ok(tagCreation > -1 && tagCreation < releaseCreation);
+    assert.doesNotMatch(DRAFT_JOB, /--target|--verify-tag/);
     assert.doesNotMatch(RELEASE_WORKFLOW, /gh release create "\$MAJOR"/);
   });
 });

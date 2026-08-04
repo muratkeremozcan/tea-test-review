@@ -103,14 +103,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag_preexisted=false
+          created_tag=false
           if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
             existing_sha=$(jq -r '.object.sha' <<< "$ref")
             if [ "$existing_sha" != "$RELEASE_SHA" ]; then
               echo "Tag $TAG already points to $existing_sha instead of $RELEASE_SHA." >&2
               exit 1
             fi
-            tag_preexisted=true
+          else
+            gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" \
+              -f sha="$RELEASE_SHA" >/dev/null
+            created_tag=true
           fi
 
           if release=$(gh release view "$TAG" \
@@ -121,34 +127,20 @@ jobs:
               exit 1
             fi
 
-            if [ "$tag_preexisted" = 'false' ]; then
-              gh api \
-                --method POST \
-                "repos/$GITHUB_REPOSITORY/git/refs" \
-                -f ref="refs/tags/$TAG" \
-                -f sha="$RELEASE_SHA" >/dev/null
-            fi
-
             url=$(jq -r '.url' <<< "$release")
             echo "Existing draft release: $url" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          # The Releases API creates a missing tag at --target. Creating the ref
-          # first races REST tag creation with the CLI's GraphQL tag check.
+          # Match the proven enterprise release path: create the exact tag first,
+          # then create its release without a second tag lookup through GraphQL.
           if ! url=$(gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
-            --target "$RELEASE_SHA" \
             --generate-notes \
             --title "$TAG"); then
-            if [ "$tag_preexisted" = 'false' ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              if cleanup_sha=$(gh api \
-                "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
-                --jq '.object.sha' 2>/dev/null) \
-                && [ "$cleanup_sha" = "$RELEASE_SHA" ]; then
-                gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" || true
-              fi
+            if [ "$created_tag" = 'true' ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" || true
             fi
             exit 1
           fi
