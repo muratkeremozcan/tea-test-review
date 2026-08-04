@@ -1,6 +1,6 @@
 # tea-test-review
 
-`tea-test-review` runs the headless [TEA test-quality review](https://github.com/muratkeremozcan/bmad-method-test-architecture-enterprise)
+`tea-test-review` runs the headless [TEA test-quality review](https://bmad-code-org.github.io/bmad-method-test-architecture-enterprise/how-to/workflows/run-test-review/)
 against a pull request's changed test files, fails the step on the review
 verdict, publishes the full report as one upserted PR comment, and uploads the
 report as a run artifact. It carries no third-party JavaScript dependencies;
