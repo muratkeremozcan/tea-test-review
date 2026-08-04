@@ -154,6 +154,8 @@ describe('release workflow contract', () => {
 
   test('creates releases from the exact tag and never the floating major', () => {
     assert.match(RELEASE_WORKFLOW, /gh release create "\$TAG"/);
+    assert.match(RELEASE_WORKFLOW, /--target "\$RELEASE_SHA"/);
+    assert.doesNotMatch(RELEASE_WORKFLOW, /--verify-tag/);
     assert.doesNotMatch(RELEASE_WORKFLOW, /gh release create "\$MAJOR"/);
   });
 });
