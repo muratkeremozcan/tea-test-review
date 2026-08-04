@@ -1,31 +1,8 @@
 name: 'TEA Test Review'
-description: |
-  Runs the headless TEA test-quality review against a pull request's changed test
-  files, fails the step on the review verdict, publishes the full report as a
-  single upserted PR comment, and uploads the report and verdict JSON as a
-  workflow-run artifact so they survive the runner.
-
-  This packages cli/examples/pr-test-review.yml from
-  bmad-method-test-architecture-enterprise into one step: pin and unpack the
-  review skill from an npm tarball, install the pinned CLI and agent, run
-  tea-test-review, then comment. Two jobs and ~230 lines of YAML per repository
-  become one `uses:`.
-
-  What it does not do, and why:
-
-    - No fork coverage. Fork pull requests receive no secrets, so the review
-      cannot run for them at all. Guard the job with an `if:` on the caller's
-      side; see README.md, and read the fork caveat there before making this a
-      required check.
-
-  Zero dependencies: no node_modules to audit, no bundle step, and no
-  third-party JavaScript between a pull request and the verdict that blocks it.
-  The only actions it uses are GitHub's own setup-node, checkout and
-  upload-artifact.
-
+description: 'Gate a pull request on the TEA test-quality review of its changed test files; runs automatically or on a mention comment.'
 author: muratkeremozcan
 branding:
-  icon: 'coffee'
+  icon: 'bar-chart'
   color: 'green'
 
 inputs:
