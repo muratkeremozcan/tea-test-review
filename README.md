@@ -206,7 +206,9 @@ workflow also triggers on `issue_comment`. `mode: manual` reviews only when
 asked — `pull_request` events skip cleanly. Either way the mention picks the
 agent, and whatever the requester wrote after it becomes the review's focus:
 
-    @codex focus on the retry paths
+```text
+@codex focus on the retry paths
+```
 
 ```yaml
 name: TEA Test Review
@@ -245,10 +247,11 @@ jobs:
   vendor's pinned defaults, because the configured values belong to the
   configured vendor and would not parse. `pull_request` runs always use the
   `agent` input.
-- **Text after the mention is the review's focus.** It reaches the reviewer
-  verbatim as a focus note: it may raise scrutiny on what it names and can
-  never waive a finding. The report quotes it as a `**Focus**:` line, so a
-  score states what steered it. This needs a tea-version whose CLI understands
+- **Text after the mention is the review's focus.** It reaches the reviewer as
+  a focus note, capped at 1000 characters: it may raise scrutiny on what it
+  names and can never waive a finding. The report quotes it as a `**Focus**:`
+  line, so a score states what steered it. This needs a tea-version whose CLI
+  understands
   `--focus`; on an older one the run fails with an unknown-option error. If
   the PR changed no test files the review still skips — a focus note does not
   invent a review set — but the skip comment quotes what you asked for and

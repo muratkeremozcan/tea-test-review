@@ -37,19 +37,21 @@ inputs:
   prompt:
     description: |
       Space-separated mention list that triggers the review from a PR comment,
-      e.g. '@claude @codex'. Matching is exact and the first configured
-      mention found in the comment wins. A mention naming a built-in vendor
-      (@claude, @codex) selects that agent for the run; any other mention
-      keeps the `agent` input. When the mention switches the agent, `model`
-      and `agent-args` reset to the selected vendor's pinned defaults, because
-      both are per-vendor and the configured values would not parse.
+      e.g. '@claude @codex'. Matching is case-sensitive and word-delimited on
+      both sides ('@claude' fires on '@claude,' but not on '@claude-alt' or
+      'team@claude'), and the first matching mention in configuration order
+      wins. A mention naming a built-in vendor (@claude, @codex) selects that
+      agent for the run; any other mention keeps the `agent` input. When the
+      mention switches the agent, `model` and `agent-args` reset to the
+      selected vendor's pinned defaults, because both are per-vendor and the
+      configured values would not parse.
 
       Only a comment from an OWNER, MEMBER or COLLABORATOR — never a bot — can
       trigger the review. An issue_comment run executes with the base
       repository's secrets and checks out the PR's code, so this gate is what
       stands between a stranger and your API key on a public repository. Text
-      after the mention is handed to the reviewer verbatim as a focus note
-      (requires a tea-version whose CLI understands --focus).
+      after the mention is handed to the reviewer as a focus note, capped at
+      1000 characters (requires a tea-version whose CLI understands --focus).
 
       Requires the workflow to trigger on issue_comment, and the action's own
       checkout lands the PR's merge ref for those runs.
@@ -358,11 +360,24 @@ runs:
     # left in the workspace survives. Skipped on a plain-issue comment: no
     # refs/pull/<n>/merge exists for one, and main.js reports the skip.
     - name: Check out the code under review
+      id: checkout
       if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
+      # A merge-conflicted PR has no merge ref; on issue_comment that failure
+      # falls through to the head-ref step below rather than failing the job.
+      continue-on-error: ${{ github.event_name == 'issue_comment' }}
       uses: actions/checkout@v4
       with:
         ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || github.sha }}
         fetch-depth: 0 # the review diffs changed test files against the base ref
+        persist-credentials: false
+        clean: false
+
+    - name: Fall back to the PR head when the merge ref does not exist
+      if: ${{ steps.checkout.outcome == 'failure' }}
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ format('refs/pull/{0}/head', github.event.issue.number) }}
+        fetch-depth: 0
         persist-credentials: false
         clean: false
 

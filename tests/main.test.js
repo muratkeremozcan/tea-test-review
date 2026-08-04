@@ -181,12 +181,26 @@ describe('mention matching, focus, and agent selection', () => {
     assert.strictEqual(action.matchMention('@Claude look', ['@claude']), null);
     assert.strictEqual(action.matchMention('@claude, look', ['@claude']), '@claude');
     assert.strictEqual(action.matchMention('@claude', ['@claude']), '@claude');
+    // Leading boundary too: a mention embedded directly after a word character
+    // (an email local part, a username) is not a trigger.
+    assert.strictEqual(action.matchMention('team@claude look', ['@claude']), null);
+    assert.strictEqual(action.matchMention('write to user@claude.com', ['@claude']), null);
+    // An occurrence that fails the boundary check does not hide a later valid one.
+    assert.strictEqual(action.matchMention('team@claude, then @claude for real', ['@claude']), '@claude');
   });
 
   test('focus is whatever the requester wrote after the mention', () => {
     assert.strictEqual(action.extractFocus('@codex focus on the retry paths', '@codex'), 'focus on the retry paths');
     assert.strictEqual(action.extractFocus('@codex', '@codex'), '');
     assert.strictEqual(action.extractFocus('hey @claude\n\nlook at auth', '@claude'), 'look at auth');
+    // Sliced after the boundary-valid occurrence the matcher accepted, not an
+    // earlier embedded one.
+    assert.strictEqual(action.extractFocus('team@codex no, @codex do this', '@codex'), 'do this');
+  });
+
+  test('focus is capped at MAX_FOCUS_LENGTH, so a giant comment cannot dominate the prompt', () => {
+    const focus = action.extractFocus(`@claude ${'x'.repeat(action.MAX_FOCUS_LENGTH + 500)}`, '@claude');
+    assert.strictEqual(focus.length, action.MAX_FOCUS_LENGTH);
   });
 
   test('a mention naming a built-in vendor selects it; anything else keeps the input', () => {

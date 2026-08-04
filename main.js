@@ -863,27 +863,46 @@ function parseMentions(raw) {
 }
 
 /**
- * First configured mention the comment contains, in configuration order.
- * Case-sensitive and word-delimited: '@claude' fires on '@claude,' but not on
- * '@claude-alt' or '@Claude'.
+ * Longest focus note the review accepts. A PR comment can run to tens of
+ * thousands of characters; the note travels verbatim in the prompt, so it is
+ * capped here, before it can become the largest thing the agent reads.
+ */
+const MAX_FOCUS_LENGTH = 1000;
+
+/**
+ * Index of the first boundary-valid occurrence of the mention, or -1.
+ * Word-delimited on BOTH sides and case-sensitive: '@claude' fires on
+ * '@claude,' but not on '@claude-alt', 'team@claude', or '@Claude'. An
+ * occurrence that fails the boundary check does not hide a later valid one.
+ */
+function mentionIndex(body, mention) {
+  const boundary = (ch) => ch === undefined || !/[A-Za-z0-9_-]/.test(ch);
+  let index = body.indexOf(mention);
+  while (index !== -1) {
+    if (boundary(body[index - 1]) && boundary(body[index + mention.length])) return index;
+    index = body.indexOf(mention, index + 1);
+  }
+  return -1;
+}
+
+/**
+ * First matching mention in CONFIGURATION order (not the earliest occurrence
+ * in the comment): the prompt list is the priority order.
  */
 function matchMention(commentBody, mentions) {
   const body = String(commentBody || '');
-  return (
-    mentions.find((mention) => {
-      const index = body.indexOf(mention);
-      if (index === -1) return false;
-      const next = body[index + mention.length];
-      return next === undefined || !/[A-Za-z0-9_-]/.test(next);
-    }) || null
-  );
+  return mentions.find((mention) => mentionIndex(body, mention) !== -1) || null;
 }
 
-/** Whatever the requester wrote after the mention is the review's focus note. */
+/**
+ * Whatever the requester wrote after the mention is the review's focus note,
+ * taken after the same boundary-valid occurrence the matcher accepted and
+ * capped at MAX_FOCUS_LENGTH.
+ */
 function extractFocus(commentBody, mention) {
   const body = String(commentBody || '');
-  const index = body.indexOf(mention);
-  return index === -1 ? '' : body.slice(index + mention.length).trim();
+  const index = mentionIndex(body, mention);
+  return index === -1 ? '' : body.slice(index + mention.length).trim().slice(0, MAX_FOCUS_LENGTH);
 }
 
 /** A mention that names a built-in vendor selects that agent; anything else keeps the agent input. */
@@ -1159,6 +1178,7 @@ module.exports = {
   resolveBaseRef,
   resolveRunBaseRef,
   MENTION_TRUSTED_ASSOCIATIONS,
+  MAX_FOCUS_LENGTH,
   parseMode,
   parseMentions,
   matchMention,
