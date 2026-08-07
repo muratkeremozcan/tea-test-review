@@ -280,14 +280,6 @@ inputs:
       review red or a failing one green.
     required: false
     default: 'true'
-  comment-tag:
-    description: |
-      Optional discriminator tag appended to the PR comment marker and title,
-      e.g. 'codex' or 'claude'. Allows multiple review steps (or matrix jobs)
-      in the same workflow to post separate comments without overwriting each
-      other.
-    required: false
-    default: ''
   github-token:
     description: 'Token used to read and write the PR comment. Needs pull-requests: write.'
     required: false
@@ -428,7 +420,6 @@ runs:
         INPUT_REPORT-PATH: ${{ inputs.report-path }}
         INPUT_JSON-PATH: ${{ inputs.json-path }}
         INPUT_COMMENT: ${{ inputs.comment }}
-        INPUT_COMMENT-TAG: ${{ inputs.comment-tag }}
         INPUT_GITHUB-TOKEN: ${{ inputs.github-token }}
         INPUT_GITHUB-API-URL: ${{ inputs.github-api-url }}
         INPUT_UPLOAD-REPORT: ${{ inputs.upload-report }}
@@ -441,7 +432,7 @@ runs:
       if: always() && inputs.upload-report == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: tea-test-review-${{ github.job }}
+        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent }}
         path: |
           ${{ inputs.report-path }}
           ${{ inputs.json-path }}

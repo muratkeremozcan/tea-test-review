@@ -116,7 +116,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           owned=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments?per_page=100" \
-            --jq '[.[] | select(.body | contains("<!-- tea-test-review -->"))]')
+            --jq '[.[] | select(.body | contains("<!-- tea-test-review"))]')
           count=$(echo "${owned}" | jq 'length')
           echo "comments owned by tea-test-review: ${count}"
           test "${count}" -eq 1

@@ -71,11 +71,11 @@ const COMMENT_MARKER = '<!-- tea-test-review -->';
 
 /**
  * Returns the hidden HTML comment marker that identifies comments owned by this action.
- * When commentTag is provided (e.g. 'codex'), returns '<!-- tea-test-review:codex -->'.
+ * Tagged by agent key, e.g. '<!-- tea-test-review:codex -->'.
  */
-function buildCommentMarker(commentTag = '') {
-  const tag = String(commentTag || '').trim();
-  return tag ? `<!-- tea-test-review:${tag} -->` : COMMENT_MARKER;
+function buildCommentMarker(agent = 'claude') {
+  const tag = String(agent || 'claude').trim();
+  return `<!-- tea-test-review:${tag} -->`;
 }
 
 /**
@@ -491,10 +491,10 @@ function fenceLeadingFrontmatter(reportText) {
  * exists for, and the digest above it is the part you read to decide whether to
  * bother.
  */
-function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName, focus, commentTag = '' }) {
-  const tag = String(commentTag || '').trim();
+function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName, focus, agent = 'claude' }) {
+  const tag = String(agent || 'claude').trim();
   const marker = buildCommentMarker(tag);
-  const headerPrefix = tag ? `## TEA Test Review (${tag})` : '## TEA Test Review';
+  const headerPrefix = `## TEA Test Review (${tag})`;
 
   if (!verdict) {
     return [
@@ -624,10 +624,26 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   return lines.join('\n');
 }
 
-/** The comment this action owns, found by its hidden marker. */
-function findOwnComment(comments, commentTag = '') {
-  const marker = buildCommentMarker(commentTag);
-  return (comments || []).find((comment) => comment && comment.body && comment.body.includes(marker)) || null;
+/**
+ * The comment this action owns, found by its hidden marker.
+ *
+ * An exact agent-tagged match always wins, checked across every comment
+ * before any legacy fallback is considered, so a stale untagged comment
+ * earlier in the list can never shadow the agent's own current comment.
+ *
+ * Only the default agent adopts an untagged legacy marker left over from
+ * before comments were agent-tagged. If every agent could adopt one, two
+ * agents racing on the same PR (dual review, matrix jobs) could both GET the
+ * same legacy comment before either PATCH lands and one would silently
+ * overwrite the other's review.
+ */
+function findOwnComment(comments, agent = 'claude') {
+  const list = comments || [];
+  const marker = buildCommentMarker(agent);
+  const exact = list.find((comment) => comment && comment.body && comment.body.includes(marker));
+  if (exact) return exact;
+  if (agent !== 'claude') return null;
+  return list.find((comment) => comment && comment.body && comment.body.includes(COMMENT_MARKER)) || null;
 }
 
 /** Pull request number from the event payload, falling back to refs/pull/N/merge. */
@@ -700,7 +716,12 @@ function agentLogin(agent, credential) {
     input: `${credential.value}\n`,
     encoding: 'utf8',
   });
-  if (result.error) {
+  // A fast-exiting login command can close stdin before the credential is
+  // fully written, which surfaces as an EPIPE `error` alongside a real `status`
+  // rather than as a spawn failure. `status == null` is the actual signal that
+  // the process never ran at all (ENOENT or similar); anything else falls
+  // through to the exit-status branch below instead of leaking the raw EPIPE.
+  if (result.error && result.status == null) {
     if (result.error.code === 'ENOENT') throw new Error(`${agent.command} not found on PATH`);
     throw new Error(`${agent.command} login failed: ${result.error.message}`);
   }
@@ -791,7 +812,7 @@ async function githubRequest({ apiUrl, token, method, path: apiPath, body }) {
 }
 
 /** Create the comment, or update the one this action already owns on the PR. */
-async function upsertComment(ctx, prNumber, body, commentTag = '') {
+async function upsertComment(ctx, prNumber, body, agent = 'claude') {
   const comments = [];
   for (let page = 1; page <= 10; page += 1) {
     const batch = await githubRequest({
@@ -804,7 +825,7 @@ async function upsertComment(ctx, prNumber, body, commentTag = '') {
     if (batch.length < 100) break;
   }
 
-  const existing = findOwnComment(comments, commentTag);
+  const existing = findOwnComment(comments, agent);
   if (existing) {
     await githubRequest({
       ...ctx,
@@ -1064,7 +1085,6 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
       extraArgs: parseExtraArgs(getInput('extra-args', env)),
     },
     comment: getBooleanInput('comment', env),
-    commentTag: getInput('comment-tag', env),
     uploadReport: getBooleanInput('upload-report', env),
     token: getInput('github-token', env),
     apiUrl: getInput('github-api-url', env) || 'https://api.github.com',
@@ -1091,7 +1111,7 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     return;
   }
 
-  const tag = opts.commentTag || '';
+  const agentKey = opts.agent?.key || 'claude';
   const body = buildCommentBody({
     verdict,
     reportText: readTextIfPresent(path.join(opts.workspace, opts.reportPath)),
@@ -1099,10 +1119,10 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     reportPath: opts.reportPath,
     reviewResult,
     focus: opts.cli?.focus,
-    commentTag: tag,
+    agent: agentKey,
     // The name the composite action's upload step uses; a test pins the two
     // constructions to match, because the comment promises this artifact.
-    artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}${tag ? `-${tag}` : ''}` : null,
+    artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}-${agentKey}` : null,
   });
 
   try {
@@ -1110,7 +1130,7 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
       { owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl },
       prNumber,
       body,
-      tag
+      agentKey
     );
     log(`${note} the review comment on #${prNumber}.`);
   } catch (err) {
@@ -1142,6 +1162,10 @@ async function run() {
     focus: trigger.focus,
   });
   opts.baseRef = await resolveRunBaseRef(opts, payload);
+  // Set as early as possible, and before anything that can fail below: the
+  // composite action's artifact-upload step reads this to name the artifact
+  // the same way the comment names it, including after a mention switch.
+  setOutput('agent', opts.agent.key);
 
   log(`TEA Test Review: ${TEA_PACKAGE}@${opts.teaVersion}, agent ${opts.agent.key} (${opts.agent.packageSpec})`);
   log(`  base ref: ${opts.baseRef}, credential: ${opts.credential.name}`);

@@ -157,6 +157,36 @@ defaults (`sonnet`, `gpt-5.6-sol`), so a verdict stays attributable to one
 model generation. The slug that ran is recorded in the verdict JSON next to
 `agent`.
 
+### Dual reviews (Codex & Claude)
+
+Run multiple review steps in the same workflow. Comments (`<!-- tea-test-review:<agent> -->`) and report artifacts (`tea-test-review-<job>-<agent>`) automatically tag by `agent` key, so each agent posts its own comment without collision:
+
+```yaml
+steps:
+  - name: Review with Codex
+    uses: muratkeremozcan/tea-test-review@v1
+    with:
+      prompt: '@codex'
+      agent: codex
+      model: gpt-5.6-luna
+      mode: 'manual'
+      agent-args: -c model_reasoning_effort=low
+      openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+
+  - name: Review with Claude
+    uses: muratkeremozcan/tea-test-review@v1
+    with:
+      prompt: '@claude'
+      agent: claude
+      mode: 'manual'
+      anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+Every comment and artifact tags by the resolved `agent` key, so this is
+automatic; there is no separate input to set. Running the same agent twice in
+one workflow (e.g. two `codex` steps with different models) is not
+disambiguated — the second step's comment and artifact overwrite the first's.
+
 ## Trigger the review from a PR comment
 
 `mode` and `prompt` are the whole surface. `mode: auto` (the default) is the
