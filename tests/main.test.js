@@ -321,6 +321,24 @@ describe('buildOptions trigger overrides', () => {
     assert.strictEqual(opts.agent.key, 'codex');
   });
 
+  test('a @codex mention switches the resolved agent, the same value the artifact name and comment tag read', () => {
+    const trigger = action.resolveTrigger({
+      mode: 'auto',
+      mentions: ['@claude', '@codex'],
+      agentInput: 'claude',
+      payload: {
+        issue: { number: 7, pull_request: {} },
+        comment: { body: '@codex focus on the retry paths', author_association: 'MEMBER', user: { type: 'User' } },
+      },
+      eventName: 'issue_comment',
+    });
+    const opts = action.buildOptions(
+      { ...baseEnv, 'INPUT_OPENAI-API-KEY': 'sk-oai' },
+      { agentOverride: trigger.agent, agentSwitched: trigger.agentSwitched, focus: trigger.focus }
+    );
+    assert.strictEqual(opts.agent.key, 'codex');
+  });
+
   test('a vendor switch resets the per-vendor knobs, because they would not parse on the new agent', () => {
     const opts = action.buildOptions(
       { ...baseEnv, 'INPUT_OPENAI-API-KEY': 'sk-oai', INPUT_MODEL: 'claude-sonnet-4-6', 'INPUT_AGENT-ARGS': '--verbose' },
@@ -948,7 +966,12 @@ describe('action.yml defaults', () => {
   });
 
   test('the artifact name in action.yml matches the one main.js promises in the comment', () => {
-    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ inputs\.agent \}\}/);
+    // inputs.agent is the unresolved, un-switched configuration value; a
+    // mention like @codex only changes opts.agent.key at runtime. The
+    // artifact name has to read the resolved value from the review step's
+    // own output, the same source publishComment uses, or the two diverge
+    // the moment a mention switches the agent.
+    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent \}\}/);
     const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
     assert.match(source, /tea-test-review-\$\{env\.GITHUB_JOB\}-\$\{agentKey\}/);
   });
@@ -1316,14 +1339,25 @@ describe('findOwnComment', () => {
     assert.strictEqual(found.id, 2);
   });
 
-  test('finds an untagged legacy comment as fallback', () => {
+  test('only the default agent adopts an untagged legacy comment on upgrade', () => {
+    const legacy = [{ id: 1, body: '<!-- tea-test-review -->\n## TEA Test Review: Approve' }];
+    assert.strictEqual(action.findOwnComment(legacy, 'claude').id, 1);
+  });
+
+  test('a non-default agent never claims a legacy comment, so two agents racing on the same PR cannot clobber each other', () => {
+    const legacy = [{ id: 1, body: '<!-- tea-test-review -->\n## TEA Test Review: Approve' }];
+    assert.strictEqual(action.findOwnComment(legacy, 'codex'), null);
+  });
+
+  test('an exact agent-tagged match wins even when an unrelated legacy comment sorts earlier in the list', () => {
     const found = action.findOwnComment(
       [
         { id: 1, body: '<!-- tea-test-review -->\n## TEA Test Review: Approve' },
+        { id: 2, body: '<!-- tea-test-review:codex -->\n## TEA Test Review (codex): Approve' },
       ],
       'codex'
     );
-    assert.strictEqual(found.id, 1);
+    assert.strictEqual(found.id, 2);
   });
 
   test('ignores a human comment that happens to mention the action', () => {

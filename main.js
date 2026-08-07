@@ -624,14 +624,26 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   return lines.join('\n');
 }
 
-/** The comment this action owns, found by its hidden marker. Also checks untagged legacy markers. */
+/**
+ * The comment this action owns, found by its hidden marker.
+ *
+ * An exact agent-tagged match always wins, checked across every comment
+ * before any legacy fallback is considered, so a stale untagged comment
+ * earlier in the list can never shadow the agent's own current comment.
+ *
+ * Only the default agent adopts an untagged legacy marker left over from
+ * before comments were agent-tagged. If every agent could adopt one, two
+ * agents racing on the same PR (dual review, matrix jobs) could both GET the
+ * same legacy comment before either PATCH lands and one would silently
+ * overwrite the other's review.
+ */
 function findOwnComment(comments, agent = 'claude') {
+  const list = comments || [];
   const marker = buildCommentMarker(agent);
-  return (
-    (comments || []).find(
-      (comment) => comment && comment.body && (comment.body.includes(marker) || comment.body.includes(COMMENT_MARKER))
-    ) || null
-  );
+  const exact = list.find((comment) => comment && comment.body && comment.body.includes(marker));
+  if (exact) return exact;
+  if (agent !== 'claude') return null;
+  return list.find((comment) => comment && comment.body && comment.body.includes(COMMENT_MARKER)) || null;
 }
 
 /** Pull request number from the event payload, falling back to refs/pull/N/merge. */
@@ -1150,6 +1162,10 @@ async function run() {
     focus: trigger.focus,
   });
   opts.baseRef = await resolveRunBaseRef(opts, payload);
+  // Set as early as possible, and before anything that can fail below: the
+  // composite action's artifact-upload step reads this to name the artifact
+  // the same way the comment names it, including after a mention switch.
+  setOutput('agent', opts.agent.key);
 
   log(`TEA Test Review: ${TEA_PACKAGE}@${opts.teaVersion}, agent ${opts.agent.key} (${opts.agent.packageSpec})`);
   log(`  base ref: ${opts.baseRef}, credential: ${opts.credential.name}`);
