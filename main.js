@@ -70,6 +70,15 @@ const SKILL_SUBPATH = path.join('package', 'src', 'workflows', 'testarch', 'bmad
 const COMMENT_MARKER = '<!-- tea-test-review -->';
 
 /**
+ * Returns the hidden HTML comment marker that identifies comments owned by this action.
+ * When commentTag is provided (e.g. 'codex'), returns '<!-- tea-test-review:codex -->'.
+ */
+function buildCommentMarker(commentTag = '') {
+  const tag = String(commentTag || '').trim();
+  return tag ? `<!-- tea-test-review:${tag} -->` : COMMENT_MARKER;
+}
+
+/**
  * GitHub caps a comment body at 65536 characters. This leaves headroom for the
  * digest and the <details> wrapper around the inlined report.
  */
@@ -482,11 +491,15 @@ function fenceLeadingFrontmatter(reportText) {
  * exists for, and the digest above it is the part you read to decide whether to
  * bother.
  */
-function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName, focus }) {
+function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName, focus, commentTag = '' }) {
+  const tag = String(commentTag || '').trim();
+  const marker = buildCommentMarker(tag);
+  const headerPrefix = tag ? `## TEA Test Review (${tag})` : '## TEA Test Review';
+
   if (!verdict) {
     return [
-      COMMENT_MARKER,
-      '## TEA Test Review: infrastructure failure',
+      marker,
+      `${headerPrefix}: infrastructure failure`,
       '',
       'The review produced no readable verdict.',
       'This is **not** a review verdict; treat the gate as broken, not as approved tests.',
@@ -502,8 +515,8 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   if (verdict.promptOnly) {
     const files = asPathList(verdict.files);
     return [
-      COMMENT_MARKER,
-      '## TEA Test Review: no review performed',
+      marker,
+      `${headerPrefix}: no review performed`,
       '',
       'The CLI ran with `--agent none`, so it built the prompt and stopped. This is a dry run, not a verdict.',
       '',
@@ -521,7 +534,7 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
     // words reads as if the mention was never heard.
     const contextCount = Array.isArray(verdict.contextFiles) ? verdict.contextFiles.length : 0;
     const changed = contextCount > 0 ? ` (${contextCount} other file${contextCount === 1 ? '' : 's'} changed)` : '';
-    const lines = [COMMENT_MARKER, '## TEA Test Review: skipped', '', `${verdict.reason ?? 'No changed test files in this PR'}${changed}.`];
+    const lines = [marker, `${headerPrefix}: skipped`, '', `${verdict.reason ?? 'No changed test files in this PR'}${changed}.`];
     if (focus) {
       lines.push(
         '',
@@ -546,8 +559,8 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   const reviewed = asPathList(verdict.reviewedFiles);
 
   const lines = [
-    COMMENT_MARKER,
-    `## TEA Test Review: ${verdict.recommendation}`,
+    marker,
+    `${headerPrefix}: ${verdict.recommendation}`,
     '',
     `- **Quality score**: ${verdict.qualityScore ?? 'n/a'}/100`,
     `- **Recommendation**: ${verdict.recommendation}`,
@@ -612,8 +625,9 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
 }
 
 /** The comment this action owns, found by its hidden marker. */
-function findOwnComment(comments) {
-  return (comments || []).find((comment) => comment && comment.body && comment.body.includes(COMMENT_MARKER)) || null;
+function findOwnComment(comments, commentTag = '') {
+  const marker = buildCommentMarker(commentTag);
+  return (comments || []).find((comment) => comment && comment.body && comment.body.includes(marker)) || null;
 }
 
 /** Pull request number from the event payload, falling back to refs/pull/N/merge. */
@@ -777,7 +791,7 @@ async function githubRequest({ apiUrl, token, method, path: apiPath, body }) {
 }
 
 /** Create the comment, or update the one this action already owns on the PR. */
-async function upsertComment(ctx, prNumber, body) {
+async function upsertComment(ctx, prNumber, body, commentTag = '') {
   const comments = [];
   for (let page = 1; page <= 10; page += 1) {
     const batch = await githubRequest({
@@ -790,7 +804,7 @@ async function upsertComment(ctx, prNumber, body) {
     if (batch.length < 100) break;
   }
 
-  const existing = findOwnComment(comments);
+  const existing = findOwnComment(comments, commentTag);
   if (existing) {
     await githubRequest({
       ...ctx,
@@ -1050,6 +1064,7 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
       extraArgs: parseExtraArgs(getInput('extra-args', env)),
     },
     comment: getBooleanInput('comment', env),
+    commentTag: getInput('comment-tag', env),
     uploadReport: getBooleanInput('upload-report', env),
     token: getInput('github-token', env),
     apiUrl: getInput('github-api-url', env) || 'https://api.github.com',
@@ -1076,6 +1091,7 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     return;
   }
 
+  const tag = opts.commentTag || '';
   const body = buildCommentBody({
     verdict,
     reportText: readTextIfPresent(path.join(opts.workspace, opts.reportPath)),
@@ -1083,16 +1099,18 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     reportPath: opts.reportPath,
     reviewResult,
     focus: opts.cli?.focus,
+    commentTag: tag,
     // The name the composite action's upload step uses; a test pins the two
     // constructions to match, because the comment promises this artifact.
-    artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}` : null,
+    artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}${tag ? `-${tag}` : ''}` : null,
   });
 
   try {
     const note = await upsertComment(
       { owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl },
       prNumber,
-      body
+      body,
+      tag
     );
     log(`${note} the review comment on #${prNumber}.`);
   } catch (err) {
@@ -1202,6 +1220,7 @@ if (require.main === module) {
 module.exports = {
   AGENTS,
   COMMENT_MARKER,
+  buildCommentMarker,
   MAX_INLINE_REPORT_CHARS,
   MAX_LISTED_REVIEWED_FILES,
   fenceLeadingFrontmatter,

@@ -1275,6 +1275,29 @@ describe('buildCommentBody', () => {
     assert.match(body, /\*\*Violations\*\*: 0 Critical \/ 0 High \/ 0 Medium \/ 0 Low/);
     assert.ok(!body.includes('undefined'));
   });
+
+  test('formats header and marker with commentTag when provided', () => {
+    const body = action.buildCommentBody({
+      verdict: { recommendation: 'Approve', qualityScore: 90 },
+      reportText: '# report',
+      runUrl,
+      commentTag: 'codex',
+    });
+    assert.match(body, /^<!-- tea-test-review:codex -->/);
+    assert.match(body, /^## TEA Test Review \(codex\): Approve/m);
+  });
+});
+
+describe('buildCommentMarker', () => {
+  test('returns default marker when tag is empty', () => {
+    assert.strictEqual(action.buildCommentMarker(''), '<!-- tea-test-review -->');
+    assert.strictEqual(action.buildCommentMarker(), '<!-- tea-test-review -->');
+  });
+
+  test('returns tagged marker when tag is provided', () => {
+    assert.strictEqual(action.buildCommentMarker('codex'), '<!-- tea-test-review:codex -->');
+    assert.strictEqual(action.buildCommentMarker('claude'), '<!-- tea-test-review:claude -->');
+  });
 });
 
 describe('findOwnComment', () => {
@@ -1283,6 +1306,17 @@ describe('findOwnComment', () => {
       { id: 1, body: 'unrelated review note' },
       { id: 2, body: `${action.COMMENT_MARKER}\n## TEA Test Review: Approve` },
     ]);
+    assert.strictEqual(found.id, 2);
+  });
+
+  test('finds a tagged comment when commentTag is specified', () => {
+    const found = action.findOwnComment(
+      [
+        { id: 1, body: '<!-- tea-test-review:claude -->\n## TEA Test Review (claude): Approve' },
+        { id: 2, body: '<!-- tea-test-review:codex -->\n## TEA Test Review (codex): Approve' },
+      ],
+      'codex'
+    );
     assert.strictEqual(found.id, 2);
   });
 
