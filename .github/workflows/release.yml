@@ -104,6 +104,7 @@ jobs:
           set -euo pipefail
 
           tag_preexisted=false
+          created_tag=false
           if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
             existing_sha=$(jq -r '.object.sha' <<< "$ref")
             if [ "$existing_sha" != "$RELEASE_SHA" ]; then
@@ -113,34 +114,101 @@ jobs:
             tag_preexisted=true
           fi
 
+          create_exact_tag() {
+            gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" \
+              -f sha="$RELEASE_SHA" >/dev/null
+            created_tag=true
+          }
+
+          verify_exact_tag() {
+            local exact_sha
+            exact_sha=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+              --jq '.object.sha')
+            if [ "$exact_sha" != "$RELEASE_SHA" ]; then
+              echo "Tag $TAG points to $exact_sha instead of $RELEASE_SHA." >&2
+              return 1
+            fi
+          }
+
+          validate_draft() {
+            local draft_json="$1"
+            local actual_draft actual_tag actual_url
+            actual_draft=$(jq -r '.isDraft' <<< "$draft_json")
+            actual_tag=$(jq -r '.tagName' <<< "$draft_json")
+            actual_url=$(jq -r '.url' <<< "$draft_json")
+
+            if [ "$actual_draft" != 'true' ]; then
+              echo "Release $TAG already exists and is published at $actual_url." >&2
+              return 1
+            fi
+            if [ "$actual_tag" != "$TAG" ]; then
+              echo "Release lookup for $TAG returned tag $actual_tag at $actual_url." >&2
+              return 1
+            fi
+          }
+
           if release=$(gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,tagName,url 2>/dev/null); then
-            if [ "$(jq -r '.isDraft' <<< "$release")" != 'true' ]; then
-              echo "Release $TAG already exists and is published." >&2
-              exit 1
-            fi
+            --json author,isDraft,tagName,targetCommitish,url 2>/dev/null); then
+            validate_draft "$release"
+            if [ "$tag_preexisted" = 'false' ]; then
+              release_target=$(jq -r '.targetCommitish' <<< "$release")
+              if [ "$release_target" != "$RELEASE_SHA" ]; then
+                release_author=$(jq -r '.author.login' <<< "$release")
+                if [ "$release_author" != 'github-actions[bot]' ]; then
+                  echo "Draft release $TAG targets $release_target and belongs to $release_author." >&2
+                  echo "Refusing to retarget a draft that this workflow did not create." >&2
+                  exit 1
+                fi
 
-            existing_tag=$(jq -r '.tagName' <<< "$release")
-            if [ "$existing_tag" != "$TAG" ]; then
-              echo "Release lookup for $TAG returned tag $existing_tag." >&2
-              exit 1
-            fi
+                release_notes_file="$RUNNER_TEMP/$TAG-release-notes.md"
+                gh api \
+                  --method POST \
+                  "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+                  -f tag_name="$TAG" \
+                  -f target_commitish="$RELEASE_SHA" \
+                  --jq '.body' > "$release_notes_file"
+                gh release edit "$TAG" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --target "$RELEASE_SHA" \
+                  --title "$TAG" \
+                  --notes-file "$release_notes_file" >/dev/null
 
+                release=$(gh release view "$TAG" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --json author,isDraft,tagName,targetCommitish,url)
+                validate_draft "$release"
+                release_target=$(jq -r '.targetCommitish' <<< "$release")
+                if [ "$release_target" != "$RELEASE_SHA" ]; then
+                  echo "Retargeted draft $TAG still targets $release_target instead of $RELEASE_SHA." >&2
+                  exit 1
+                fi
+              fi
+              create_exact_tag
+            fi
+            verify_exact_tag
             url=$(jq -r '.url' <<< "$release")
             echo "Existing draft release: $url" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          # Let the Releases API create a missing tag and its release together.
-          # This avoids racing a Git Data ref write against release creation.
+          if [ "$tag_preexisted" = 'false' ]; then
+            create_exact_tag
+          fi
+
+          # Let the Releases API create a draft for the exact, existing tag.
+          # Draft URLs use an untagged-* slug until publication by design.
           if ! url=$(gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
             --target "$RELEASE_SHA" \
             --generate-notes \
             --title "$TAG"); then
-            if [ "$tag_preexisted" = 'false' ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$created_tag" = 'true' ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               if cleanup_sha=$(gh api \
                 "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
                 --jq '.object.sha' 2>/dev/null) \
@@ -151,42 +219,20 @@ jobs:
             exit 1
           fi
 
-          expected_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
-          if [ "$url" != "$expected_url" ]; then
-            echo "Release creation for $TAG returned unexpected URL $url." >&2
-            echo "Expected $expected_url." >&2
-            exit 1
-          fi
-
           if ! created_release=$(gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,tagName,url); then
+            --json author,isDraft,tagName,targetCommitish,url); then
             echo "Release creation returned $url, but no release is bound to $TAG." >&2
             exit 1
           fi
 
-          created_tag=$(jq -r '.tagName' <<< "$created_release")
+          validate_draft "$created_release"
           created_url=$(jq -r '.url' <<< "$created_release")
-          if [ "$created_tag" != "$TAG" ]; then
-            echo "Release creation for $TAG produced release tag $created_tag at $created_url." >&2
-            exit 1
-          fi
           if [ "$created_url" != "$url" ]; then
             echo "Release creation returned $url, but $TAG resolves to $created_url." >&2
             exit 1
           fi
-          if [ "$(jq -r '.isDraft' <<< "$created_release")" != 'true' ]; then
-            echo "Release $TAG was created without draft status at $created_url." >&2
-            exit 1
-          fi
-
-          created_sha=$(gh api \
-            "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
-            --jq '.object.sha')
-          if [ "$created_sha" != "$RELEASE_SHA" ]; then
-            echo "Created tag $TAG points to $created_sha instead of $RELEASE_SHA." >&2
-            exit 1
-          fi
+          verify_exact_tag
 
           echo "Draft release: $url" >> "$GITHUB_STEP_SUMMARY"
           echo 'Review it, select Publish this Action to the GitHub Marketplace, then publish.' >> "$GITHUB_STEP_SUMMARY"

@@ -153,19 +153,41 @@ describe('release workflow contract', () => {
     assert.match(RELEASE_WORKFLOW, /major_sha=\$\(resolve_tag_commit "\$MAJOR"\)/);
   });
 
-  test('keeps the existing-tag guard and lets release creation make a missing exact tag', () => {
+  test('keeps the existing-tag guard and creates a missing exact tag before a new draft', () => {
     const tagLookup = DRAFT_JOB.indexOf('if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"');
     const mismatchGuard = DRAFT_JOB.indexOf('Tag $TAG already points to $existing_sha instead of $RELEASE_SHA.');
+    const tagCreation = DRAFT_JOB.indexOf('-f ref="refs/tags/$TAG"');
     const releaseCreation = DRAFT_JOB.indexOf('gh release create "$TAG"');
+    const newDraftTagGuard = DRAFT_JOB.lastIndexOf('if [ "$tag_preexisted" = \'false\' ]; then', releaseCreation);
+    const newDraftPreparation = DRAFT_JOB.slice(newDraftTagGuard, releaseCreation);
 
     assert.ok(tagLookup > -1 && tagLookup < releaseCreation);
     assert.ok(mismatchGuard > tagLookup && mismatchGuard < releaseCreation);
+    assert.ok(tagCreation > mismatchGuard && tagCreation < releaseCreation);
+    assert.ok(newDraftTagGuard > tagCreation);
+    assert.match(newDraftPreparation, /create_exact_tag/);
     assert.match(DRAFT_JOB, /--target "\$RELEASE_SHA"/);
-    assert.doesNotMatch(DRAFT_JOB, /-f ref="refs\/tags\/\$TAG"|--verify-tag/);
+    assert.doesNotMatch(DRAFT_JOB, /--verify-tag/);
     assert.doesNotMatch(RELEASE_WORKFLOW, /gh release create "\$MAJOR"/);
   });
 
-  test("verifies the created release's own tag before reporting success", () => {
+  test('retargets an automated stale draft before repairing its missing exact tag', () => {
+    const existingDraftStart = DRAFT_JOB.indexOf('if release=$(gh release view "$TAG"');
+    const existingDraftEnd = DRAFT_JOB.indexOf('# Let the Releases API');
+    const existingDraft = DRAFT_JOB.slice(existingDraftStart, existingDraftEnd);
+    const retarget = existingDraft.indexOf('gh release edit "$TAG"');
+    const tagRepair = existingDraft.indexOf('create_exact_tag');
+
+    assert.match(existingDraft, /--json author,isDraft,tagName,targetCommitish,url/);
+    assert.match(existingDraft, /validate_draft "\$release"/);
+    assert.match(existingDraft, /if \[ "\$release_target" != "\$RELEASE_SHA" \]/);
+    assert.match(existingDraft, /if \[ "\$release_author" != 'github-actions\[bot\]' \]/);
+    assert.match(existingDraft, /releases\/generate-notes/);
+    assert.ok(retarget > -1 && retarget < tagRepair);
+    assert.match(existingDraft, /verify_exact_tag/);
+  });
+
+  test("verifies the created draft's own tag and accepts its synthetic URL", () => {
     const releaseCreation = DRAFT_JOB.indexOf('gh release create "$TAG"');
     const releaseVerification = DRAFT_JOB.indexOf('created_release=$(gh release view "$TAG"');
     const successSummary = DRAFT_JOB.indexOf('echo "Draft release: $url"');
@@ -173,7 +195,9 @@ describe('release workflow contract', () => {
 
     assert.ok(releaseCreation > -1 && releaseCreation < releaseVerification);
     assert.ok(releaseVerification < successSummary);
-    assert.match(verificationBlock, /--json isDraft,tagName,url/);
-    assert.match(verificationBlock, /if \[ "\$created_tag" != "\$TAG" \]/);
+    assert.match(verificationBlock, /--json author,isDraft,tagName,targetCommitish,url/);
+    assert.match(verificationBlock, /validate_draft "\$created_release"/);
+    assert.match(verificationBlock, /if \[ "\$created_url" != "\$url" \]/);
+    assert.doesNotMatch(DRAFT_JOB, /expected_url|releases\/tag\/\$TAG/);
   });
 });
