@@ -704,7 +704,12 @@ function agentLogin(agent, credential) {
     input: `${credential.value}\n`,
     encoding: 'utf8',
   });
-  if (result.error) {
+  // A fast-exiting login command can close stdin before the credential is
+  // fully written, which surfaces as an EPIPE `error` alongside a real `status`
+  // rather than as a spawn failure. `status == null` is the actual signal that
+  // the process never ran at all (ENOENT or similar); anything else falls
+  // through to the exit-status branch below instead of leaking the raw EPIPE.
+  if (result.error && result.status == null) {
     if (result.error.code === 'ENOENT') throw new Error(`${agent.command} not found on PATH`);
     throw new Error(`${agent.command} login failed: ${result.error.message}`);
   }
