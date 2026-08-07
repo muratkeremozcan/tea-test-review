@@ -103,27 +103,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          created_tag=false
+          tag_preexisted=false
           if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
             existing_sha=$(jq -r '.object.sha' <<< "$ref")
             if [ "$existing_sha" != "$RELEASE_SHA" ]; then
               echo "Tag $TAG already points to $existing_sha instead of $RELEASE_SHA." >&2
               exit 1
             fi
-          else
-            gh api \
-              --method POST \
-              "repos/$GITHUB_REPOSITORY/git/refs" \
-              -f ref="refs/tags/$TAG" \
-              -f sha="$RELEASE_SHA" >/dev/null
-            created_tag=true
+            tag_preexisted=true
           fi
 
           if release=$(gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,url 2>/dev/null); then
+            --json isDraft,tagName,url 2>/dev/null); then
             if [ "$(jq -r '.isDraft' <<< "$release")" != 'true' ]; then
               echo "Release $TAG already exists and is published." >&2
+              exit 1
+            fi
+
+            existing_tag=$(jq -r '.tagName' <<< "$release")
+            if [ "$existing_tag" != "$TAG" ]; then
+              echo "Release lookup for $TAG returned tag $existing_tag." >&2
               exit 1
             fi
 
@@ -132,16 +132,51 @@ jobs:
             exit 0
           fi
 
-          # Match the proven enterprise release path: create the exact tag first,
-          # then create its release without a second tag lookup through GraphQL.
+          # Let the Releases API create a missing tag and its release together.
+          # This avoids racing a Git Data ref write against release creation.
           if ! url=$(gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
+            --target "$RELEASE_SHA" \
             --generate-notes \
             --title "$TAG"); then
-            if [ "$created_tag" = 'true' ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" || true
+            if [ "$tag_preexisted" = 'false' ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              if cleanup_sha=$(gh api \
+                "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+                --jq '.object.sha' 2>/dev/null) \
+                && [ "$cleanup_sha" = "$RELEASE_SHA" ]; then
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" || true
+              fi
             fi
+            exit 1
+          fi
+
+          expected_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          if [ "$url" != "$expected_url" ]; then
+            echo "Release creation for $TAG returned unexpected URL $url." >&2
+            echo "Expected $expected_url." >&2
+            exit 1
+          fi
+
+          if ! created_release=$(gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,tagName,url); then
+            echo "Release creation returned $url, but no release is bound to $TAG." >&2
+            exit 1
+          fi
+
+          created_tag=$(jq -r '.tagName' <<< "$created_release")
+          created_url=$(jq -r '.url' <<< "$created_release")
+          if [ "$created_tag" != "$TAG" ]; then
+            echo "Release creation for $TAG produced release tag $created_tag at $created_url." >&2
+            exit 1
+          fi
+          if [ "$created_url" != "$url" ]; then
+            echo "Release creation returned $url, but $TAG resolves to $created_url." >&2
+            exit 1
+          fi
+          if [ "$(jq -r '.isDraft' <<< "$created_release")" != 'true' ]; then
+            echo "Release $TAG was created without draft status at $created_url." >&2
             exit 1
           fi
 
@@ -229,11 +264,13 @@ jobs:
             exit 1
           fi
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "major=$major" >> "$GITHUB_OUTPUT"
-          echo "release-sha=$release_sha" >> "$GITHUB_OUTPUT"
-          echo "highest-tag=$highest_tag" >> "$GITHUB_OUTPUT"
-          echo "release-order=$release_order" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "major=$major"
+            echo "release-sha=$release_sha"
+            echo "highest-tag=$highest_tag"
+            echo "release-order=$release_order"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run unit tests
         run: node --test tests/*.test.js
@@ -261,6 +298,7 @@ jobs:
               && grep --fixed-strings --word-regexp --quiet "$TAG" "$marketplace_page"; then
               exit 0
             fi
+            echo "Marketplace check $attempt of 24 did not find $TAG." >&2
             sleep 5
           done
 
