@@ -948,9 +948,9 @@ describe('action.yml defaults', () => {
   });
 
   test('the artifact name in action.yml matches the one main.js promises in the comment', () => {
-    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}/);
+    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ inputs\.agent \}\}/);
     const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-    assert.match(source, /tea-test-review-\$\{env\.GITHUB_JOB\}/);
+    assert.match(source, /tea-test-review-\$\{env\.GITHUB_JOB\}-\$\{agentKey\}/);
   });
 });
 
@@ -1061,12 +1061,12 @@ describe('buildCommentBody', () => {
 
   test('carries the marker, so the next push updates this comment instead of adding one', () => {
     const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.ok(body.startsWith(action.COMMENT_MARKER));
+    assert.ok(body.startsWith('<!-- tea-test-review:claude -->'));
   });
 
   test('the digest states score, recommendation, violations and reviewed-file count', () => {
     const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.match(body, /## TEA Test Review: Request Changes/);
+    assert.match(body, /## TEA Test Review \(claude\): Request Changes/);
     assert.match(body, /\*\*Quality score\*\*: 64\/100/);
     assert.match(body, /\*\*Violations\*\*: 1 Critical \/ 2 High \/ 3 Medium \/ 4 Low/);
     assert.match(body, /\*\*Reviewed files\*\*: 2/);
@@ -1184,7 +1184,7 @@ describe('buildCommentBody', () => {
       verdict: { skipped: true, reason: 'no changed test files in diff' },
       runUrl,
     });
-    assert.match(body, /## TEA Test Review: skipped/);
+    assert.match(body, /## TEA Test Review \(claude\): skipped/);
     assert.match(body, /no changed test files in diff\./);
     assert.ok(!body.includes('Quality score'));
   });
@@ -1226,7 +1226,7 @@ describe('buildCommentBody', () => {
   test('an --agent none dry run says no review happened, rather than a verdict of undefined', () => {
     // Reachable through extra-args, and the payload has no recommendation at all.
     const body = action.buildCommentBody({ verdict: { promptOnly: true, files: ['tests/a.spec.ts'] }, runUrl });
-    assert.match(body, /## TEA Test Review: no review performed/);
+    assert.match(body, /## TEA Test Review \(claude\): no review performed/);
     assert.match(body, /Files that would have been reviewed: 1\./);
     assert.ok(!body.includes('undefined'));
   });
@@ -1242,7 +1242,7 @@ describe('buildCommentBody', () => {
   test('no verdict at all reads as a broken gate, never as approved tests', () => {
     // The distinction the whole action turns on: exit 2 and 3 are not verdicts.
     const body = action.buildCommentBody({ verdict: null, runUrl, reviewResult: 'exit 3 (agent failure)' });
-    assert.match(body, /## TEA Test Review: infrastructure failure/);
+    assert.match(body, /## TEA Test Review \(claude\): infrastructure failure/);
     assert.match(body, /\*\*not\*\* a review verdict/);
     assert.match(body, /treat the gate as broken, not as approved tests/);
     assert.match(body, /exit 3 \(agent failure\)/);
@@ -1276,12 +1276,12 @@ describe('buildCommentBody', () => {
     assert.ok(!body.includes('undefined'));
   });
 
-  test('formats header and marker with commentTag when provided', () => {
+  test('formats header and marker with agent key', () => {
     const body = action.buildCommentBody({
       verdict: { recommendation: 'Approve', qualityScore: 90 },
       reportText: '# report',
       runUrl,
-      commentTag: 'codex',
+      agent: 'codex',
     });
     assert.match(body, /^<!-- tea-test-review:codex -->/);
     assert.match(body, /^## TEA Test Review \(codex\): Approve/m);
@@ -1289,27 +1289,23 @@ describe('buildCommentBody', () => {
 });
 
 describe('buildCommentMarker', () => {
-  test('returns default marker when tag is empty', () => {
-    assert.strictEqual(action.buildCommentMarker(''), '<!-- tea-test-review -->');
-    assert.strictEqual(action.buildCommentMarker(), '<!-- tea-test-review -->');
-  });
-
-  test('returns tagged marker when tag is provided', () => {
+  test('returns agent-tagged marker', () => {
     assert.strictEqual(action.buildCommentMarker('codex'), '<!-- tea-test-review:codex -->');
     assert.strictEqual(action.buildCommentMarker('claude'), '<!-- tea-test-review:claude -->');
+    assert.strictEqual(action.buildCommentMarker(), '<!-- tea-test-review:claude -->');
   });
 });
 
 describe('findOwnComment', () => {
-  test('finds the comment carrying the marker', () => {
+  test('finds the comment carrying the agent-tagged marker', () => {
     const found = action.findOwnComment([
       { id: 1, body: 'unrelated review note' },
-      { id: 2, body: `${action.COMMENT_MARKER}\n## TEA Test Review: Approve` },
+      { id: 2, body: `<!-- tea-test-review:claude -->\n## TEA Test Review (claude): Approve` },
     ]);
     assert.strictEqual(found.id, 2);
   });
 
-  test('finds a tagged comment when commentTag is specified', () => {
+  test('finds a tagged comment matching the agent', () => {
     const found = action.findOwnComment(
       [
         { id: 1, body: '<!-- tea-test-review:claude -->\n## TEA Test Review (claude): Approve' },
@@ -1318,6 +1314,16 @@ describe('findOwnComment', () => {
       'codex'
     );
     assert.strictEqual(found.id, 2);
+  });
+
+  test('finds an untagged legacy comment as fallback', () => {
+    const found = action.findOwnComment(
+      [
+        { id: 1, body: '<!-- tea-test-review -->\n## TEA Test Review: Approve' },
+      ],
+      'codex'
+    );
+    assert.strictEqual(found.id, 1);
   });
 
   test('ignores a human comment that happens to mention the action', () => {

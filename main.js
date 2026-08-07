@@ -71,11 +71,11 @@ const COMMENT_MARKER = '<!-- tea-test-review -->';
 
 /**
  * Returns the hidden HTML comment marker that identifies comments owned by this action.
- * When commentTag is provided (e.g. 'codex'), returns '<!-- tea-test-review:codex -->'.
+ * Tagged by agent key, e.g. '<!-- tea-test-review:codex -->'.
  */
-function buildCommentMarker(commentTag = '') {
-  const tag = String(commentTag || '').trim();
-  return tag ? `<!-- tea-test-review:${tag} -->` : COMMENT_MARKER;
+function buildCommentMarker(agent = 'claude') {
+  const tag = String(agent || 'claude').trim();
+  return `<!-- tea-test-review:${tag} -->`;
 }
 
 /**
@@ -491,10 +491,10 @@ function fenceLeadingFrontmatter(reportText) {
  * exists for, and the digest above it is the part you read to decide whether to
  * bother.
  */
-function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName, focus, commentTag = '' }) {
-  const tag = String(commentTag || '').trim();
+function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResult, artifactName, focus, agent = 'claude' }) {
+  const tag = String(agent || 'claude').trim();
   const marker = buildCommentMarker(tag);
-  const headerPrefix = tag ? `## TEA Test Review (${tag})` : '## TEA Test Review';
+  const headerPrefix = `## TEA Test Review (${tag})`;
 
   if (!verdict) {
     return [
@@ -624,10 +624,14 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   return lines.join('\n');
 }
 
-/** The comment this action owns, found by its hidden marker. */
-function findOwnComment(comments, commentTag = '') {
-  const marker = buildCommentMarker(commentTag);
-  return (comments || []).find((comment) => comment && comment.body && comment.body.includes(marker)) || null;
+/** The comment this action owns, found by its hidden marker. Also checks untagged legacy markers. */
+function findOwnComment(comments, agent = 'claude') {
+  const marker = buildCommentMarker(agent);
+  return (
+    (comments || []).find(
+      (comment) => comment && comment.body && (comment.body.includes(marker) || comment.body.includes(COMMENT_MARKER))
+    ) || null
+  );
 }
 
 /** Pull request number from the event payload, falling back to refs/pull/N/merge. */
@@ -791,7 +795,7 @@ async function githubRequest({ apiUrl, token, method, path: apiPath, body }) {
 }
 
 /** Create the comment, or update the one this action already owns on the PR. */
-async function upsertComment(ctx, prNumber, body, commentTag = '') {
+async function upsertComment(ctx, prNumber, body, agent = 'claude') {
   const comments = [];
   for (let page = 1; page <= 10; page += 1) {
     const batch = await githubRequest({
@@ -804,7 +808,7 @@ async function upsertComment(ctx, prNumber, body, commentTag = '') {
     if (batch.length < 100) break;
   }
 
-  const existing = findOwnComment(comments, commentTag);
+  const existing = findOwnComment(comments, agent);
   if (existing) {
     await githubRequest({
       ...ctx,
@@ -1064,7 +1068,6 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
       extraArgs: parseExtraArgs(getInput('extra-args', env)),
     },
     comment: getBooleanInput('comment', env),
-    commentTag: getInput('comment-tag', env),
     uploadReport: getBooleanInput('upload-report', env),
     token: getInput('github-token', env),
     apiUrl: getInput('github-api-url', env) || 'https://api.github.com',
@@ -1091,7 +1094,7 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     return;
   }
 
-  const tag = opts.commentTag || '';
+  const agentKey = opts.agent?.key || 'claude';
   const body = buildCommentBody({
     verdict,
     reportText: readTextIfPresent(path.join(opts.workspace, opts.reportPath)),
@@ -1099,10 +1102,10 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
     reportPath: opts.reportPath,
     reviewResult,
     focus: opts.cli?.focus,
-    commentTag: tag,
+    agent: agentKey,
     // The name the composite action's upload step uses; a test pins the two
     // constructions to match, because the comment promises this artifact.
-    artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}${tag ? `-${tag}` : ''}` : null,
+    artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}-${agentKey}` : null,
   });
 
   try {
@@ -1110,7 +1113,7 @@ async function publishComment(opts, verdict, reviewResult, env = process.env) {
       { owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl },
       prNumber,
       body,
-      tag
+      agentKey
     );
     log(`${note} the review comment on #${prNumber}.`);
   } catch (err) {
