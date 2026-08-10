@@ -271,7 +271,12 @@ costs you the review.
 |  `3` | Agent or report-parse failure. **No review happened**                  |
 
 `2` and `3` mean no review happened; the action says so in the log and in
-the comment, and never reports either as approved tests.
+the comment, and never reports either as approved tests. Exit `3` is retried
+once (a fresh agent invocation, not a report re-parse) before the action gives
+up: a crashed agent process is often a one-off blip rather than a real
+problem with the diff, and codex succeeding on the same PR that claude failed
+on is the usual signature of that. `2` is never retried; a config or
+environment error will not fix itself on a second try.
 
 ### Choose how much the verdict blocks
 

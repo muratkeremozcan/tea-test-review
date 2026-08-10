@@ -93,6 +93,17 @@ const MAX_LISTED_REVIEWED_FILES = 10;
 const REQUEST_TIMEOUT_MS = 30_000;
 const COMMENT_RETRY_LIMIT = 3;
 
+/**
+ * Bound on re-running the review CLI after exit 3 (agent or report-parse
+ * failure). One retry only: each attempt is a full agent invocation over the
+ * whole diff, so this is not free, and a persistent failure (a genuinely
+ * broken report format, a config problem masquerading as exit 3) must still
+ * surface rather than be retried away. Exit 1 (a real verdict) and exit 2 (an
+ * environment/config error) are never retried: the first is not transient by
+ * definition, and the second will not fix itself.
+ */
+const AGENT_RETRY_LIMIT = 1;
+
 /** The CLI's exit codes, which this action passes through unchanged. */
 const EXIT_MEANING = {
   0: 'review passed, was skipped, or a verdict failure was waived',
@@ -1236,10 +1247,20 @@ async function run() {
     envPass: opts.agent.needsEnvPass ? opts.credential.name : '',
   });
 
-  const status = runCommand(binaryName('tea-test-review'), args, {
-    cwd: opts.workspace,
-    env: childEnv(opts.credential),
-  });
+  // Exit 3 means the agent crashed or the report could not be parsed: not a
+  // verdict either way, and a one-off agent failure (a dropped connection, an
+  // upstream 5xx that never reached stdout) does not deserve to break the
+  // gate outright. Retried up to AGENT_RETRY_LIMIT times; exit 1 (a real
+  // verdict) and exit 2 (env/config) fall straight through, unretried, below.
+  let status;
+  for (let attempt = 0; ; attempt += 1) {
+    status = runCommand(binaryName('tea-test-review'), args, {
+      cwd: opts.workspace,
+      env: childEnv(opts.credential),
+    });
+    if (status !== 3 || attempt >= AGENT_RETRY_LIMIT) break;
+    warn(`TEA Test Review: agent or report-parse failure (exit 3) on attempt ${attempt + 1}; retrying once before treating the gate as broken.`);
+  }
 
   const verdict = readJsonIfPresent(path.join(opts.workspace, opts.jsonPath));
   for (const [name, value] of Object.entries(outputsFromVerdict(verdict))) setOutput(name, value);
