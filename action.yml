@@ -278,6 +278,9 @@ inputs:
       A comment that cannot be posted is a warning, never a failure: the verdict
       is the step's exit code, and losing the comment must not turn a passing
       review red or a failing one green.
+
+      Also governs a mention trigger's :eyes: reaction: set to 'false' to get
+      neither the reaction nor the comment.
     required: false
     default: 'true'
   github-token:

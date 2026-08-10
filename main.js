@@ -844,6 +844,26 @@ async function upsertComment(ctx, prNumber, body, agent = 'claude') {
   return 'Created';
 }
 
+/**
+ * React to the comment that triggered a mention-mode review, so the
+ * mention gets a visible, immediate acknowledgement instead of silence for
+ * however long the CLI run takes (minutes, and vendors vary widely). Never
+ * throws: a reaction that could not be added is cosmetic and must not affect
+ * the verdict or the step's exit code.
+ */
+async function addReaction(ctx, commentId, content = 'eyes') {
+  try {
+    await githubRequest({
+      ...ctx,
+      method: 'POST',
+      path: `/repos/${ctx.owner}/${ctx.repo}/issues/comments/${commentId}/reactions`,
+      body: { content },
+    });
+  } catch (err) {
+    warn(`Could not react to the triggering comment: ${err.message}. The review still runs; this is cosmetic.`);
+  }
+}
+
 function readJsonIfPresent(file) {
   try {
     if (!fs.existsSync(file)) return null;
@@ -1175,6 +1195,18 @@ async function run() {
   if (trigger.agentSwitched) {
     log(`  the mention selected ${trigger.agent}: model and agent-args reset to that vendor's pinned defaults`);
   }
+
+  // React before the (possibly long) CLI run starts, not after: the point is
+  // to prove the mention was received while the reviewer is still watching,
+  // not to summarize what already happened.
+  if (trigger.via === 'mention' && opts.comment && opts.token) {
+    const repo = parseRepository(process.env);
+    const commentId = payload?.comment?.id;
+    if (repo && commentId != null) {
+      await addReaction({ owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl }, commentId, 'eyes');
+    }
+  }
+
   if (!opts.agent.verified) {
     warn(
       `Agent "${opts.agent.key}" is not a built-in vendor. It runs as --agent claude --agent-cmd ${opts.agent.command}, ` +
@@ -1282,5 +1314,6 @@ module.exports = {
   installSkill,
   githubRequest,
   upsertComment,
+  addReaction,
   buildOptions,
 };
