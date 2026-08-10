@@ -1181,6 +1181,18 @@ async function run() {
     agentSwitched: trigger.agentSwitched,
     focus: trigger.focus,
   });
+
+  // React first, before resolveRunBaseRef or anything else that can be slow
+  // or fail: the point is to prove the mention was received while the
+  // reviewer is still watching, not to summarize what already happened.
+  if (trigger.via === 'mention' && opts.comment && opts.token) {
+    const repo = parseRepository(process.env);
+    const commentId = payload?.comment?.id;
+    if (repo && commentId != null) {
+      await addReaction({ owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl }, commentId, 'eyes');
+    }
+  }
+
   opts.baseRef = await resolveRunBaseRef(opts, payload);
   // Set as early as possible, and before anything that can fail below: the
   // composite action's artifact-upload step reads this to name the artifact
@@ -1194,17 +1206,6 @@ async function run() {
   }
   if (trigger.agentSwitched) {
     log(`  the mention selected ${trigger.agent}: model and agent-args reset to that vendor's pinned defaults`);
-  }
-
-  // React before the (possibly long) CLI run starts, not after: the point is
-  // to prove the mention was received while the reviewer is still watching,
-  // not to summarize what already happened.
-  if (trigger.via === 'mention' && opts.comment && opts.token) {
-    const repo = parseRepository(process.env);
-    const commentId = payload?.comment?.id;
-    if (repo && commentId != null) {
-      await addReaction({ owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl }, commentId, 'eyes');
-    }
   }
 
   if (!opts.agent.verified) {
