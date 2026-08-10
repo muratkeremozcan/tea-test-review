@@ -246,6 +246,11 @@ jobs:
   API key on a public repository.
 - On `issue_comment` runs the action checks out the PR's merge ref and
   resolves the base branch through the pulls API; add no checkout step.
+- A recognized mention gets an immediate :eyes: reaction, before the CLI
+  runs. The review itself can take anywhere from under a minute to well over
+  ten, depending on the vendor and the diff, with no other feedback in
+  between, so the reaction is the only sign a mention was received rather
+  than missed. Tied to the `comment` input.
 
 Only the selected agent's credential is required; an unset secret resolves to
 empty and is ignored, so a claude-only repository can leave `openai-api-key`

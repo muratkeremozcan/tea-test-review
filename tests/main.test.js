@@ -1555,6 +1555,44 @@ describe('upsertComment', () => {
   });
 });
 
+describe('addReaction', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
+
+  test('posts an eyes reaction to the triggering comment by default', async () => {
+    const calls = [];
+    global.fetch = async (url, init) => {
+      calls.push({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+      return { ok: true, status: 200, json: async () => ({ id: 1 }), text: async () => '' };
+    };
+    await action.addReaction(ctx, 9, 'eyes');
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].url, 'https://api.github.com/repos/o/r/issues/comments/9/reactions');
+    assert.strictEqual(calls[0].method, 'POST');
+    assert.deepStrictEqual(calls[0].body, { content: 'eyes' });
+  });
+
+  test('swallows a failure as a warning: cosmetic, must never throw', async () => {
+    global.fetch = async () => ({ ok: false, status: 403, json: async () => null, text: async () => 'nope' });
+    const originalWrite = process.stdout.write;
+    let logged = '';
+    process.stdout.write = (msg) => {
+      logged += msg;
+      return true;
+    };
+    try {
+      await action.addReaction(ctx, 9, 'eyes');
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    assert.match(logged, /::warning::Could not react to the triggering comment/);
+  });
+});
+
 describe('fenceLeadingFrontmatter', () => {
   test('fences a leading frontmatter block and leaves the body untouched', () => {
     const out = action.fenceLeadingFrontmatter("---\na: 1\nb: 2\n---\n\n# Title\n\ntext\n");
