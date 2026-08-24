@@ -896,6 +896,26 @@ function readEventPayload(env = process.env) {
   return env.GITHUB_EVENT_PATH ? readJsonIfPresent(env.GITHUB_EVENT_PATH) : null;
 }
 
+function runReviewCli(opts, args, commandRunner = runCommand) {
+  let status;
+  for (let attempt = 0; ; attempt += 1) {
+    status = commandRunner(binaryName('tea-test-review'), args, {
+      cwd: opts.workspace,
+      env: childEnv(opts.credential),
+    });
+    if (status !== 3 || attempt >= AGENT_RETRY_LIMIT) break;
+    for (const artifact of [opts.reportPath, opts.jsonPath]) {
+      fs.rmSync(path.join(opts.workspace, artifact), { force: true });
+    }
+    warn(`TEA Test Review: agent or report-parse failure (exit 3) on attempt ${attempt + 1}; retrying once before treating the gate as broken.`);
+  }
+
+  return {
+    status,
+    verdict: readJsonIfPresent(path.join(opts.workspace, opts.jsonPath)),
+  };
+}
+
 /**
  * Base ref when neither the caller nor the event stated one. A pull_request
  * run always sets GITHUB_BASE_REF; an issue_comment run on a pull request does
@@ -1252,17 +1272,7 @@ async function run() {
   // upstream 5xx that never reached stdout) does not deserve to break the
   // gate outright. Retried up to AGENT_RETRY_LIMIT times; exit 1 (a real
   // verdict) and exit 2 (env/config) fall straight through, unretried, below.
-  let status;
-  for (let attempt = 0; ; attempt += 1) {
-    status = runCommand(binaryName('tea-test-review'), args, {
-      cwd: opts.workspace,
-      env: childEnv(opts.credential),
-    });
-    if (status !== 3 || attempt >= AGENT_RETRY_LIMIT) break;
-    warn(`TEA Test Review: agent or report-parse failure (exit 3) on attempt ${attempt + 1}; retrying once before treating the gate as broken.`);
-  }
-
-  const verdict = readJsonIfPresent(path.join(opts.workspace, opts.jsonPath));
+  const { status, verdict } = runReviewCli(opts, args);
   for (const [name, value] of Object.entries(outputsFromVerdict(verdict))) setOutput(name, value);
   setOutput('report-path', opts.reportPath);
   setOutput('json-path', opts.jsonPath);
@@ -1338,4 +1348,5 @@ module.exports = {
   upsertComment,
   addReaction,
   buildOptions,
+  runReviewCli,
 };

@@ -18,6 +18,7 @@
 const { test, describe, afterEach } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const action = require('../main.js');
@@ -1421,6 +1422,52 @@ describe('isRetryableStatus', () => {
   for (const status of [401, 403, 404, 422]) {
     test(`${status} is not retried, because it will not fix itself`, () => {
       assert.strictEqual(action.isRetryableStatus(status), false);
+    });
+  }
+});
+
+describe('runReviewCli', () => {
+  for (const scenario of [
+    { name: 'retries an agent failure that then passes', statuses: [3, 0], expectedStatus: 0 },
+    { name: 'stops after one retry when the agent fails again', statuses: [3, 3], expectedStatus: 3 },
+    { name: 'does not retry a verdict failure', statuses: [1], expectedStatus: 1 },
+    { name: 'does not retry a configuration failure', statuses: [2], expectedStatus: 2 },
+  ]) {
+    test(scenario.name, () => {
+      const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'tea-test-review-retry-'));
+      const opts = {
+        workspace,
+        reportPath: 'review.md',
+        jsonPath: 'review.json',
+        credential: { name: 'TEST_AGENT_KEY', value: 'secret' },
+      };
+      const reportFile = path.join(workspace, opts.reportPath);
+      const jsonFile = path.join(workspace, opts.jsonPath);
+      let calls = 0;
+
+      try {
+        const result = action.runReviewCli(opts, ['--base', 'origin/main'], (command, args, options) => {
+          calls += 1;
+          assert.strictEqual(command, action.binaryName('tea-test-review'));
+          assert.deepStrictEqual(args, ['--base', 'origin/main']);
+          assert.strictEqual(options.cwd, workspace);
+          assert.strictEqual(options.env.TEST_AGENT_KEY, 'secret');
+          if (calls > 1) {
+            assert.strictEqual(fs.existsSync(reportFile), false, 'retry starts without the prior report');
+            assert.strictEqual(fs.existsSync(jsonFile), false, 'retry starts without the prior verdict');
+          }
+          fs.writeFileSync(reportFile, `attempt ${calls}\n`);
+          fs.writeFileSync(jsonFile, JSON.stringify({ recommendation: `attempt ${calls}` }));
+          return scenario.statuses[calls - 1];
+        });
+
+        assert.strictEqual(calls, scenario.statuses.length);
+        assert.strictEqual(result.status, scenario.expectedStatus);
+        assert.strictEqual(result.verdict.recommendation, `attempt ${calls}`);
+        assert.strictEqual(fs.readFileSync(reportFile, 'utf8'), `attempt ${calls}\n`);
+      } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+      }
     });
   }
 });
