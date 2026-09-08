@@ -710,8 +710,9 @@ describe('buildCliArgs', () => {
       maxCritical: '',
       minFiles: '',
       failOn: '',
+      gateOn: '',
     });
-    for (const flag of ['--test-dir', '--scope', '--min-score', '--max-critical', '--min-files', '--fail-on']) {
+    for (const flag of ['--test-dir', '--scope', '--min-score', '--max-critical', '--min-files', '--fail-on', '--gate-on']) {
       assert.ok(!args.includes(flag), `${flag} should be absent`);
     }
   });
@@ -723,6 +724,7 @@ describe('buildCliArgs', () => {
       maxCritical: '0',
       minFiles: '2',
       failOn: 'block',
+      gateOn: 'introduced',
       testDir: 'test',
       scope: 'directory',
     });
@@ -731,6 +733,7 @@ describe('buildCliArgs', () => {
       ['--max-critical', '0'],
       ['--min-files', '2'],
       ['--fail-on', 'block'],
+      ['--gate-on', 'introduced'],
       ['--test-dir', 'test'],
       ['--scope', 'directory'],
     ]) {
@@ -859,6 +862,12 @@ describe('action.yml defaults', () => {
   test('base-ref is declared empty and derived at runtime', () => {
     assert.strictEqual(declaredDefault('base-ref'), '');
     assert.strictEqual(buildWith({ GITHUB_BASE_REF: 'main' }).baseRef, 'origin/main');
+  });
+
+  test('gate-on stays empty by default and passes through when set', () => {
+    assert.strictEqual(declaredDefault('gate-on'), '');
+    assert.strictEqual(buildWith({}).cli.gateOn, '');
+    assert.strictEqual(buildWith({ 'INPUT_GATE-ON': 'all' }).cli.gateOn, 'all');
   });
 
   test('agent-args are parsed as a shell-style argument list', () => {
@@ -1031,17 +1040,24 @@ describe('outputsFromVerdict', () => {
     recommendation: 'Approve',
     qualityScore: 92,
     violations: { critical: 0, high: 1, medium: 2, low: 3 },
+    rawQualityScore: 97,
+    gateOn: 'introduced',
+    gatingQualityScore: 96,
+    gatingViolations: { critical: 0, high: 0, medium: 1, low: 0 },
     reviewedFiles: ['tests/checkout.spec.ts'],
   };
 
   test('a passing verdict maps every field', () => {
     assert.deepStrictEqual(action.outputsFromVerdict(passing), {
       recommendation: 'Approve',
-      'quality-score': '92',
+      'quality-score': '96',
+      'full-quality-score': '92',
+      'raw-quality-score': '97',
+      'gate-on': 'introduced',
       critical: '0',
-      high: '1',
-      medium: '2',
-      low: '3',
+      high: '0',
+      medium: '1',
+      low: '0',
       'reviewed-files': '1',
       skipped: 'false',
     });
@@ -1054,6 +1070,9 @@ describe('outputsFromVerdict', () => {
     assert.strictEqual(outputs.skipped, 'true');
     assert.strictEqual(outputs.recommendation, '');
     assert.strictEqual(outputs['quality-score'], '');
+    assert.strictEqual(outputs['full-quality-score'], '');
+    assert.strictEqual(outputs['raw-quality-score'], '');
+    assert.strictEqual(outputs['gate-on'], '');
     assert.strictEqual(outputs['reviewed-files'], '0');
   });
 
@@ -1078,9 +1097,23 @@ describe('buildCommentBody', () => {
   const verdict = {
     recommendation: 'Request Changes',
     qualityScore: 64,
+    rawQualityScore: 84,
+    scoreOverrideRule: 'Highest severity Critical caps effective score at 69.',
+    verdictRule: 'High findings require Request Changes.',
+    gateOn: 'introduced',
+    gatingQualityScore: 79,
+    gatingViolations: { critical: 0, high: 2, medium: 1, low: 0 },
+    allFindingsRecommendation: 'Block',
     violations: { critical: 1, high: 2, medium: 3, low: 4 },
     reviewedFiles: ['tests/checkout.spec.ts', 'tests/cart.spec.ts'],
-    keyWeaknesses: ['first', 'second', 'third', 'fourth'],
+    findings: [
+      { row: 'H1', title: 'first' },
+      { row: 'H2', title: 'second' },
+      { row: 'H3', title: 'third' },
+      { row: 'H4', title: 'fourth' },
+    ],
+    keyWeaknesses: ['[H1] free-form first', '[H2] free-form second', '[H3] free-form third', '[H4] free-form fourth'],
+    advisoryObservations: ['n/a', 'Consider an optional helper'],
   };
 
   test('carries the marker, so the next push updates this comment instead of adding one', () => {
@@ -1091,9 +1124,19 @@ describe('buildCommentBody', () => {
   test('the digest states score, recommendation, violations and reviewed-file count', () => {
     const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
     assert.match(body, /## TEA Test Review \(claude\): Request Changes/);
-    assert.match(body, /\*\*Quality score\*\*: 64\/100/);
-    assert.match(body, /\*\*Violations\*\*: 1 Critical \/ 2 High \/ 3 Medium \/ 4 Low/);
+    assert.match(body, /\*\*Gate mode\*\*: introduced/);
+    assert.match(body, /\*\*Gating quality score\*\*: 79\/100/);
+    assert.match(body, /\*\*Full-review effective score\*\*: 64\/100/);
+    assert.match(body, /\*\*Raw deduction score\*\*: 84\/100/);
+    assert.match(body, /\*\*Full-review recommendation\*\*: Block/);
+    assert.match(body, /\*\*Gating violations\*\*: 0 Critical \/ 2 High \/ 1 Medium \/ 0 Low/);
     assert.match(body, /\*\*Reviewed files\*\*: 2/);
+  });
+
+  test('omits the full-review recommendation when the gate never overrode it', () => {
+    const { allFindingsRecommendation, ...verdictWithoutDelta } = verdict;
+    const body = action.buildCommentBody({ verdict: verdictWithoutDelta, reportText: '# report', runUrl });
+    assert.ok(!body.includes('Full-review recommendation'));
   });
 
   test('the digest names every reviewed file, so a finding citing a line number is attributable', () => {
@@ -1118,9 +1161,16 @@ describe('buildCommentBody', () => {
 
   test('at most three key weaknesses, so the digest stays a digest', () => {
     const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.match(body, /- first/);
-    assert.match(body, /- third/);
-    assert.ok(!body.includes('- fourth'));
+    assert.match(body, /- \[H1\] first/);
+    assert.match(body, /- \[H3\] third/);
+    assert.ok(!body.includes('- [H4] fourth'));
+    assert.ok(!body.includes('free-form'));
+  });
+
+  test('advisories are separate and empty or n/a items are hidden', () => {
+    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
+    assert.match(body, /\*\*Advisory observations\*\*:\n- Consider an optional helper/);
+    assert.ok(!body.includes('- n/a'));
   });
 
   test('the full report is inlined in a collapsed block, which is the reason to comment at all', () => {
@@ -1199,7 +1249,7 @@ describe('buildCommentBody', () => {
 
   test('a missing report keeps the digest instead of dropping the comment', () => {
     const body = action.buildCommentBody({ verdict, reportText: null, runUrl, reportPath: 'test-review.md' });
-    assert.match(body, /\*\*Quality score\*\*: 64\/100/);
+    assert.match(body, /\*\*Gating quality score\*\*: 79\/100/);
     assert.match(body, /not readable from the workspace/);
   });
 
@@ -1296,7 +1346,7 @@ describe('buildCommentBody', () => {
       reportText: '# report',
       runUrl,
     });
-    assert.match(body, /\*\*Violations\*\*: 0 Critical \/ 0 High \/ 0 Medium \/ 0 Low/);
+    assert.match(body, /\*\*Gating violations\*\*: 0 Critical \/ 0 High \/ 0 Medium \/ 0 Low/);
     assert.ok(!body.includes('undefined'));
   });
 

@@ -386,6 +386,7 @@ function buildCliArgs(opts) {
   if (opts.maxCritical) args.push('--max-critical', opts.maxCritical);
   if (opts.minFiles) args.push('--min-files', opts.minFiles);
   if (opts.failOn) args.push('--fail-on', opts.failOn);
+  if (opts.gateOn) args.push('--gate-on', opts.gateOn);
 
   if (opts.usePlaywrightUtils === true) args.push('--use-playwright-utils');
   if (opts.usePlaywrightUtils === false) args.push('--no-use-playwright-utils');
@@ -442,11 +443,15 @@ function assertShipsCli(packageJson, spec) {
 /** Verdict fields to step outputs. A skipped review has nulls, not zeros. */
 function outputsFromVerdict(verdict) {
   const v = verdict || {};
-  const counts = v.violations || {};
+  const counts = v.gatingViolations || v.violations || {};
   const skipped = v.skipped === true;
+  const gatingQualityScore = v.gatingQualityScore ?? v.qualityScore;
   return {
     recommendation: skipped || v.recommendation == null ? '' : String(v.recommendation),
-    'quality-score': skipped || v.qualityScore == null ? '' : String(v.qualityScore),
+    'quality-score': skipped || gatingQualityScore == null ? '' : String(gatingQualityScore),
+    'full-quality-score': skipped || v.qualityScore == null ? '' : String(v.qualityScore),
+    'raw-quality-score': skipped || v.rawQualityScore == null ? '' : String(v.rawQualityScore),
+    'gate-on': skipped ? '' : String(v.gateOn ?? v.reviewProvenance?.gateMode ?? ''),
     critical: String(counts.critical ?? 0),
     high: String(counts.high ?? 0),
     medium: String(counts.medium ?? 0),
@@ -562,9 +567,23 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
     return lines.join('\n');
   }
 
-  const counts = verdict.violations ?? {};
+  const counts = verdict.gatingViolations ?? verdict.violations ?? {};
   const violations = `${counts.critical ?? 0} Critical / ${counts.high ?? 0} High / ${counts.medium ?? 0} Medium / ${counts.low ?? 0} Low`;
-  const weaknesses = (verdict.keyWeaknesses ?? []).slice(0, 3);
+  const findings = Array.isArray(verdict.findings) ? verdict.findings : [];
+  const findingByRow = new Map(findings.filter((finding) => finding?.row).map((finding) => [finding.row, finding]));
+  const displayItems = (items) =>
+    (Array.isArray(items) ? items : [])
+      .map((item) => String(item).trim())
+      .filter((item) => item && !/^n\s*\/?\s*a[.!]?$/i.test(item));
+  const weaknesses = displayItems(verdict.keyWeaknesses)
+    .map((item) => {
+      const row = item.match(/^\[([A-Z]\d+)\](?:\s+|$)/)?.[1];
+      const finding = findingByRow.get(row);
+      return finding ? `[${row}] ${finding.title}` : null;
+    })
+    .filter(Boolean)
+    .slice(0, 3);
+  const advisories = displayItems(verdict.advisoryObservations).slice(0, 3);
   // Named, not just counted: a finding that cites "line 200" is unattributable
   // on a pull request touching more than one test file.
   const reviewed = asPathList(verdict.reviewedFiles);
@@ -573,9 +592,15 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
     marker,
     `${headerPrefix}: ${verdict.recommendation}`,
     '',
-    `- **Quality score**: ${verdict.qualityScore ?? 'n/a'}/100`,
+    `- **Gate mode**: ${verdict.gateOn ?? verdict.reviewProvenance?.gateMode ?? 'all'}`,
+    `- **Gating quality score**: ${verdict.gatingQualityScore ?? verdict.qualityScore ?? 'n/a'}/100`,
+    `- **Full-review effective score**: ${verdict.qualityScore ?? 'n/a'}/100`,
+    `- **Raw deduction score**: ${verdict.rawQualityScore ?? 'n/a'}/100`,
+    `- **Full-review score rule**: ${verdict.scoreOverrideRule ?? 'n/a'}`,
     `- **Recommendation**: ${verdict.recommendation}`,
-    `- **Violations**: ${violations}`,
+    ...(verdict.allFindingsRecommendation ? [`- **Full-review recommendation**: ${verdict.allFindingsRecommendation}`] : []),
+    `- **Gating violations**: ${violations}`,
+    `- **Verdict rule**: ${verdict.verdictRule ?? 'n/a'}`,
     `- **Reviewed files**: ${reviewed.length}`,
     ...cappedPathBullets(reviewed, '  '),
   ];
@@ -588,6 +613,15 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   if (reviewer.length > 0) {
     lines.push(`- **Reviewer**: ${reviewer.join(' / ')}`);
   }
+  const provenance = verdict.reviewProvenance ?? {};
+  if (Object.keys(provenance).length > 0) {
+    lines.push(
+      `- **TeA CLI / skill rubric**: ${provenance.teaCliVersion ?? 'unavailable'} / ${provenance.skillRubricVersion ?? 'unavailable'}`,
+      `- **Base / head SHA**: ${provenance.baseSha ?? 'unavailable'} / ${provenance.headSha ?? 'unavailable'}`
+    );
+    if (provenance.triggerComment) lines.push(`- **Trigger comment**: ${provenance.triggerComment}`);
+    if (provenance.workflowRun) lines.push(`- **Workflow run**: ${provenance.workflowRun}`);
+  }
 
   if (verdict.waived) {
     lines.push(
@@ -599,6 +633,9 @@ function buildCommentBody({ verdict, reportText, runUrl, reportPath, reviewResul
   }
   if (weaknesses.length > 0) {
     lines.push('', '**Key weaknesses**:', ...weaknesses.map((w) => `- ${w}`));
+  }
+  if (advisories.length > 0) {
+    lines.push('', '**Advisory observations**:', ...advisories.map((item) => `- ${item}`));
   }
   lines.push('');
 
@@ -1130,6 +1167,7 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
       maxCritical: getInput('max-critical', env),
       minFiles: getInput('min-files', env),
       failOn: getInput('fail-on', env),
+      gateOn: getInput('gate-on', env),
       usePlaywrightUtils: parseTriState(getInput('use-playwright-utils', env), 'use-playwright-utils'),
       usePactjsUtils: parseTriState(getInput('use-pactjs-utils', env), 'use-pactjs-utils'),
       pactMcp: parsePactMcp(getInput('pact-mcp', env)),
