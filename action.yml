@@ -211,6 +211,13 @@ inputs:
     description: "Weakest recommendation that fails the step: 'request-changes' (the CLI's default) or 'block'."
     required: false
     default: ''
+  gate-on:
+    description: |
+      Findings allowed to affect the PR verdict: 'introduced' or 'all'.
+      Empty uses the CLI default: introduced for git-diff PR reviews and all
+      when --files bypasses git evidence.
+    required: false
+    default: ''
 
   # ─── TEA config keys ────────────────────────────────────────────────────────
   # Stated rather than left to resolution on purpose. CI installs the skill from
@@ -299,19 +306,28 @@ outputs:
     description: "'Approve', 'Approve with Comments', 'Request Changes' or 'Block'. Empty on a skipped review."
     value: ${{ steps.review.outputs.recommendation }}
   quality-score:
-    description: 'Quality score out of 100. Empty on a skipped review.'
+    description: 'Gating quality score out of 100. Empty on a skipped review.'
     value: ${{ steps.review.outputs.quality-score }}
+  full-quality-score:
+    description: 'Effective score across all findings. Empty on a skipped review.'
+    value: ${{ steps.review.outputs.full-quality-score }}
+  raw-quality-score:
+    description: 'Uncapped deduction score across all findings. Empty on a skipped review.'
+    value: ${{ steps.review.outputs.raw-quality-score }}
+  gate-on:
+    description: "Effective gate mode: 'introduced' or 'all'. Empty on a skipped review."
+    value: ${{ steps.review.outputs.gate-on }}
   critical:
-    description: 'Critical violation count.'
+    description: 'Gating Critical violation count.'
     value: ${{ steps.review.outputs.critical }}
   high:
-    description: 'High violation count.'
+    description: 'Gating High violation count.'
     value: ${{ steps.review.outputs.high }}
   medium:
-    description: 'Medium violation count.'
+    description: 'Gating Medium violation count.'
     value: ${{ steps.review.outputs.medium }}
   low:
-    description: 'Low violation count.'
+    description: 'Gating Low violation count.'
     value: ${{ steps.review.outputs.low }}
   reviewed-files:
     description: 'Number of files the report says it reviewed. This is the manifest --min-files evaluates, not the diff size.'
@@ -416,6 +432,7 @@ runs:
         INPUT_MAX-CRITICAL: ${{ inputs.max-critical }}
         INPUT_MIN-FILES: ${{ inputs.min-files }}
         INPUT_FAIL-ON: ${{ inputs.fail-on }}
+        INPUT_GATE-ON: ${{ inputs.gate-on }}
         INPUT_USE-PLAYWRIGHT-UTILS: ${{ inputs.use-playwright-utils }}
         INPUT_USE-PACTJS-UTILS: ${{ inputs.use-pactjs-utils }}
         INPUT_PACT-MCP: ${{ inputs.pact-mcp }}

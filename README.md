@@ -348,6 +348,9 @@ with a consequence you would not guess:
 - `base-ref` derives from the event, or through the pulls API on an
   `issue_comment` run, so a pull request into a release branch diffs against
   that branch.
+- `gate-on` selects whether only PR-introduced findings or all findings affect
+  the verdict. Empty uses the CLI default: `introduced` for PR diffs and `all`
+  when `--files` bypasses git evidence.
 - `use-playwright-utils`, `use-pactjs-utils`, `pact-mcp`: state them in CI,
   where a tarball install writes no `_bmad/tea/config.yaml`. Empty resolves
   to the module default (Playwright Utils on, `pactjs-utils` off, Pact MCP
@@ -375,11 +378,23 @@ the
 | Output                              | Value                                                                              |
 | ----------------------------------- | ---------------------------------------------------------------------------------- |
 | `recommendation`                    | `Approve`, `Approve with Comments`, `Request Changes` or `Block`. Empty on a skip. |
-| `quality-score`                     | Score out of 100. Empty on a skip.                                                 |
-| `critical`, `high`, `medium`, `low` | Violation counts.                                                                  |
+| `quality-score`                     | Gating score out of 100. Empty on a skip.                                          |
+| `full-quality-score`                | Severity-capped score across all findings. Empty on a skip.                        |
+| `raw-quality-score`                 | Uncapped deduction score across all findings. Empty on a skip.                     |
+| `gate-on`                           | Effective gate mode: `introduced` or `all`. Empty on a skip.                       |
+| `critical`, `high`, `medium`, `low` | Gating violation counts.                                                           |
 | `reviewed-files`                    | How many files the report says it reviewed.                                        |
 | `skipped`                           | `true` when there were no changed test files.                                      |
 | `report-path`, `json-path`          | Workspace-relative paths of the report and verdict.                                |
+
+**Breaking change for anyone pinned to a floating major tag** (`@v1`, `@v2`,
+…): `quality-score` used to be the effective score across every finding. It
+now defaults to the gating score — the `introduced`-only subset, since that's
+the CLI's own default gate mode for a git-diff PR review — and the old value
+moved to `full-quality-score`. A workflow that branches on
+`steps.review.outputs.quality-score` (e.g. `< 80` gates) will see a different
+number after pulling a floating tag. Release this behind a major version bump,
+not a floating-tag move on the current major.
 
 ## Other agents
 
