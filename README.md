@@ -19,6 +19,8 @@ Copy one of the two [proven configurations](#proven-configurations) below;
 both ran live end to end against real pull requests. Two requirements:
 
 - `pull-requests: write`, when `comment` is left on.
+- `checks: write`, when `check-run` is left on. Without it the review is
+  invisible on the pull request until it finishes.
 - A credential: `ANTHROPIC_API_KEY` (bills per token through the Anthropic
   Console) or `CLAUDE_CODE_OAUTH_TOKEN` (a long-lived token from
   `claude setup-token`, billed to an existing Claude subscription), as the
@@ -76,6 +78,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # for the review comment
+      checks: write # for the check run that shows the review in the PR's Checks list
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,6 +131,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # for the review comment
+      checks: write # for the check run that shows the review in the PR's Checks list
     steps:
       - uses: actions/checkout@v4
         with:
@@ -221,6 +225,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # for the review comment
+      checks: write # for the check run that shows the review in the PR's Checks list
     steps:
       - uses: muratkeremozcan/tea-test-review@<sha>
         with:
@@ -247,10 +252,13 @@ jobs:
 - On `issue_comment` runs the action checks out the PR's merge ref and
   resolves the base branch through the pulls API; add no checkout step.
 - A recognized mention gets an immediate :eyes: reaction, before the CLI
-  runs. The review itself can take anywhere from under a minute to well over
-  ten, depending on the vendor and the diff, with no other feedback in
-  between, so the reaction is the only sign a mention was received rather
-  than missed. Tied to the `comment` input.
+  runs. Tied to the `comment` input.
+- The review also opens a check run against the PR's head commit before it
+  starts, so a run in flight is visible in the Checks list for the ten-plus
+  minutes it can take. This needs `checks: write`. Without it the run is
+  invisible on the PR: an `issue_comment` workflow is repository-scoped, so
+  GitHub binds its check suite to the default branch and the PR's Checks list
+  shows nothing at all. Tied to the `check-run` input.
 
 Only the selected agent's credential is required; an unset secret resolves to
 empty and is ignored, so a claude-only repository can leave `openai-api-key`

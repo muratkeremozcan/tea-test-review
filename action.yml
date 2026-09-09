@@ -299,8 +299,55 @@ inputs:
       neither the reaction nor the comment.
     required: false
     default: 'true'
+  check-run:
+    description: |
+      Publish a check run against the pull request's head commit, opened as
+      `in_progress` before the review starts and closed with its verdict. Needs
+      `checks: write`.
+
+      This is the only way a mention-triggered review is visible while it runs.
+      An `issue_comment` workflow is repository-scoped, so GitHub binds its
+      check suite to the default branch and the pull request's Checks list shows
+      nothing at all for however long the review takes.
+
+      The conclusion mirrors the step's exit code: `success` on a passing
+      verdict, `failure` on a failing one and on a broken gate, `neutral` on a
+      skipped review and on an `--agent none` dry run. GitHub counts `neutral`
+      as satisfying a required check, which is the intent: a review that never
+      ran is no evidence of quality, and no reason to block a pull request that
+      changed no tests.
+
+      Requiring it in branch protection works, on two conditions. The workflow
+      needs a `pull_request` trigger, because a mention-only workflow opens no
+      check until somebody comments and the pull request would wait forever for
+      one. And a check run left `in_progress` blocks the merge until it closes:
+      a run killed outright, by a cancel or by the runner itself, leaves nothing
+      alive to close it, and a `checks: write` that was never granted opens
+      nothing at all. A later run on the same commit adopts an open check run
+      rather than stacking a second one under the same name, so a re-run clears
+      the first case.
+
+      A check run that cannot be created is a warning, never a failure, on the
+      same contract as the comment. The Checks API needs a GitHub App
+      installation token: the default GITHUB_TOKEN qualifies and a classic
+      personal access token is rejected with a 403.
+    required: false
+    default: 'true'
+  check-run-name:
+    description: |
+      Name of the check run. Branch protection matches a required check by exact
+      name, so this stays fixed no matter which agent runs: a mention can switch
+      vendors mid-pull-request, and a name carrying the vendor would stop
+      reporting under the name that was required. The agent that ran is named in
+      the check's own output instead.
+
+      Two reviews in one workflow must set two different names. `POST` creates
+      one check run per name per commit, so a shared name would have the second
+      job adopt the first's run and both would write over each other.
+    required: false
+    default: 'TEA Test Review'
   github-token:
-    description: 'Token used to read and write the PR comment. Needs pull-requests: write.'
+    description: 'Token used to read and write the PR comment and check run. Needs pull-requests: write, and checks: write for the check run.'
     required: false
     default: '${{ github.token }}'
   github-api-url:
@@ -449,6 +496,8 @@ runs:
         INPUT_REPORT-PATH: ${{ inputs.report-path }}
         INPUT_JSON-PATH: ${{ inputs.json-path }}
         INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_CHECK-RUN: ${{ inputs.check-run }}
+        INPUT_CHECK-RUN-NAME: ${{ inputs.check-run-name }}
         INPUT_GITHUB-TOKEN: ${{ inputs.github-token }}
         INPUT_GITHUB-API-URL: ${{ inputs.github-api-url }}
         INPUT_UPLOAD-REPORT: ${{ inputs.upload-report }}

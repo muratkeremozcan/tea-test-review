@@ -105,6 +105,11 @@ const COMMENT_RETRY_LIMIT = 3;
 const AGENT_RETRY_LIMIT = 1;
 
 /** The CLI's exit codes, which this action passes through unchanged. */
+// The Checks API documents 65535 for output.summary and enforces it in bytes.
+// output.title has no documented cap, so 255 is a conservative unknown.
+const MAX_CHECK_RUN_SUMMARY_BYTES = 65535;
+const MAX_CHECK_RUN_TITLE_BYTES = 255;
+
 const EXIT_MEANING = {
   0: 'review passed, was skipped, or a verdict failure was waived',
   1: 'review verdict failure',
@@ -716,9 +721,26 @@ function workflowRunUrl(env = process.env) {
   return `${server}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`;
 }
 
-/** Retry a transient failure only. A 403 on a missing permission will not fix itself. */
-function isRetryableStatus(status) {
-  return status === 429 || (status >= 500 && status <= 599);
+/**
+ * Retry a transient failure only. A 403 on a missing permission will not fix
+ * itself, but a secondary rate limit also answers 403, and that one will: the
+ * body is the only thing that tells them apart.
+ */
+function isRetryableStatus(status, body = '') {
+  if (status === 429 || (status >= 500 && status <= 599)) return true;
+  return status === 403 && /secondary rate limit/i.test(String(body));
+}
+
+/**
+ * Seconds GitHub asked us to wait, when it asked. Documented as "you should not
+ * retry your request until after that many seconds has elapsed", so a shorter
+ * flat backoff just burns another request against the same limit.
+ */
+function retryAfterMs(headers, attempt) {
+  const raw = headers && typeof headers.get === 'function' ? headers.get('retry-after') : null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, 60) * 1000;
+  return 1000 * attempt;
 }
 
 // ─── IO ───────────────────────────────────────────────────────────────────────
@@ -852,8 +874,8 @@ async function githubRequest({ apiUrl, token, method, path: apiPath, body }) {
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      if (isRetryableStatus(res.status) && attempt <= COMMENT_RETRY_LIMIT) {
-        await sleep(1000 * attempt);
+      if (isRetryableStatus(res.status, text) && attempt <= COMMENT_RETRY_LIMIT) {
+        await sleep(retryAfterMs(res.headers, attempt));
         continue;
       }
       throw new Error(`GitHub API returned ${res.status}: ${text.slice(0, 300)}`);
@@ -916,6 +938,236 @@ async function addReaction(ctx, commentId, content = 'eyes') {
   }
 }
 
+/**
+ * The pull request, fetched at most once per run. Two callers need it (the
+ * base ref an issue_comment run does not carry, and the head SHA the check run
+ * must be keyed to), and a cache keeps that one API call instead of two.
+ */
+async function fetchPullRequest({ token, apiUrl, prCache }, repo, prNumber) {
+  const key = `${repo.owner}/${repo.repo}#${prNumber}`;
+  if (prCache && prCache.has(key)) return prCache.get(key);
+  const pr = await githubRequest({
+    apiUrl,
+    token,
+    method: 'GET',
+    path: `/repos/${repo.owner}/${repo.repo}/pulls/${prNumber}`,
+  });
+  // Only a usable body is cached. githubRequest yields null for a 200 that
+  // does not parse, and caching that would hand the base-ref lookup a failure
+  // it used to recover from with its own request.
+  if (prCache && pr) prCache.set(key, pr);
+  return pr;
+}
+
+/**
+ * The pull request's head SHA, which is the only commit its Checks list
+ * renders against. GITHUB_SHA is no substitute: on an issue_comment run it is
+ * the default branch's tip, and on a pull_request run it is the merge commit.
+ * Neither is a commit in the pull request, so a check run keyed to either one
+ * is created successfully and then shows up nowhere.
+ */
+async function resolveHeadSha(opts, repo, prNumber, payload) {
+  const fromPayload = payload?.pull_request?.head?.sha;
+  if (typeof fromPayload === 'string' && fromPayload !== '') return fromPayload;
+  const pr = await fetchPullRequest(opts, repo, prNumber);
+  const sha = pr?.head?.sha;
+  return typeof sha === 'string' && sha !== '' ? sha : null;
+}
+
+/**
+ * Open the check run that makes the review visible while it is still running.
+ * An issue_comment workflow is repository-scoped, so GitHub binds its check
+ * suite to the default branch and the pull request shows nothing at all: for
+ * the ten-plus minutes a review can take, the only signal is the :eyes:
+ * reaction. Never throws, for the same reason the comment never does: the
+ * verdict is the step's exit code, and losing a cosmetic surface must not move
+ * it.
+ */
+async function findOpenCheckRun(ctx, headSha, name) {
+  const found = await githubRequest({
+    ...ctx,
+    method: 'GET',
+    path: `/repos/${ctx.owner}/${ctx.repo}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(name)}&per_page=100`,
+  });
+  const runs = Array.isArray(found?.check_runs) ? found.check_runs : [];
+  const open = runs.find((r) => r && r.status !== 'completed' && Number.isInteger(r.id));
+  return open ? open.id : null;
+}
+
+async function createCheckRun(ctx, { headSha, name, detailsUrl, agent }) {
+  try {
+    // POST always creates, so a re-run would stack a second run under the same
+    // name and let whichever finishes last decide the gate. Worse, a run that
+    // was killed outright left one pinned at in_progress, which a required
+    // check has no UI to clear. Adopting the open one fixes both.
+    const open = await findOpenCheckRun(ctx, headSha, name).catch(() => null);
+    if (open != null) {
+      log(`Reusing the check run left open on ${headSha.slice(0, 7)} by an earlier attempt.`);
+      return open;
+    }
+    const created = await githubRequest({
+      ...ctx,
+      method: 'POST',
+      path: `/repos/${ctx.owner}/${ctx.repo}/check-runs`,
+      body: {
+        name,
+        head_sha: headSha,
+        status: 'in_progress',
+        started_at: new Date().toISOString(),
+        details_url: detailsUrl,
+        output: checkRunOutput(
+          'Review in progress',
+          // The agent lives here rather than in the name, which branch
+          // protection matches on and which must therefore not move when a
+          // mention switches vendors.
+          `The TEA test review is running${agent ? ` on ${agent}` : ''}. [Live log](${detailsUrl})`
+        ),
+      },
+    });
+    return Number.isInteger(created?.id) ? created.id : null;
+  } catch (err) {
+    warn(
+      `Could not create the check run: ${err.message}. The review still runs; this is cosmetic. ` +
+        'Grant the job `checks: write`, and leave github-token as the default GITHUB_TOKEN: the Checks API ' +
+        'rejects a classic personal access token. Set check-run: false to stop trying.'
+    );
+    return null;
+  }
+}
+
+/**
+ * Trim to a byte budget, because the API's limit is bytes and one multi-byte
+ * character counts for several. Cuts on a character boundary so the result is
+ * never invalid UTF-8.
+ */
+function clampBytes(text, maxBytes) {
+  const value = String(text ?? '');
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  const suffix = '\n\n_(truncated)_';
+  const budget = maxBytes - Buffer.byteLength(suffix, 'utf8');
+  let cut = value;
+  while (Buffer.byteLength(cut, 'utf8') > budget) cut = cut.slice(0, Math.max(0, cut.length - Math.ceil((Buffer.byteLength(cut, 'utf8') - budget) / 4) - 1));
+  return cut + suffix;
+}
+
+/** `output` within the API's documented limits: 65535 bytes of summary. */
+function checkRunOutput(title, summary) {
+  return { title: clampBytes(title, MAX_CHECK_RUN_TITLE_BYTES), summary: clampBytes(summary, MAX_CHECK_RUN_SUMMARY_BYTES) };
+}
+
+/** Close the check run. Never throws, for the reason createCheckRun does not. */
+async function completeCheckRun(ctx, checkRunId, { conclusion, title, summary }) {
+  if (checkRunId == null) return;
+  try {
+    await githubRequest({
+      ...ctx,
+      method: 'PATCH',
+      path: `/repos/${ctx.owner}/${ctx.repo}/check-runs/${checkRunId}`,
+      body: {
+        status: 'completed',
+        conclusion,
+        completed_at: new Date().toISOString(),
+        output: checkRunOutput(title, summary),
+      },
+    });
+  } catch (err) {
+    // A check left at in_progress under a required name blocks the merge with
+    // no UI to clear it, so one retry drops `output` (the only part of the body
+    // that can be rejected for its size or content) and closes the run bare.
+    try {
+      await githubRequest({
+        ...ctx,
+        method: 'PATCH',
+        path: `/repos/${ctx.owner}/${ctx.repo}/check-runs/${checkRunId}`,
+        body: { status: 'completed', conclusion, completed_at: new Date().toISOString() },
+      });
+      warn(`Could not write the check run's summary: ${err.message}. It was closed as ${conclusion} without one.`);
+    } catch (retryErr) {
+      warn(
+        `Could not complete the check run: ${retryErr.message}. It stays in progress on the pull request, and a ` +
+          "later run on the same commit adopts it. The verdict is unaffected; it is this step's exit code."
+      );
+    }
+  }
+}
+
+/**
+ * Open the check run for this pull request, or nothing when there is no
+ * pull request, no head SHA, or no permission. Returns the id or null.
+ */
+async function openCheckRun(opts, ctx, repo, payload, env = process.env) {
+  if (!opts.checkRun) return null;
+  if (!ctx) {
+    warn(
+      'check-run is enabled but there is no usable github-token, so the review will not be visible on the pull ' +
+        'request while it runs. Pass github-token, or set check-run: false.'
+    );
+    return null;
+  }
+  const prNumber = resolvePrNumber(payload, env);
+  if (prNumber == null) {
+    log('No pull request in context, so there is no commit to attach a check run to.');
+    return null;
+  }
+  const headSha = await resolveHeadSha(opts, repo, prNumber, payload).catch((err) => {
+    warn(`Could not resolve the head SHA of #${prNumber}: ${err.message}. The review still runs without a check run.`);
+    return null;
+  });
+  if (!headSha) return null;
+  return createCheckRun(ctx, {
+    headSha,
+    name: opts.checkRunName,
+    detailsUrl: workflowRunUrl(env),
+    agent: opts.agent.key,
+  });
+}
+
+/**
+ * The check run mirrors the step's exit code, because two gates that can
+ * disagree are worse than one. `neutral` is reserved for a review that never
+ * ran: a skipped review is no evidence of quality, and it is no reason to
+ * block a pull request that changed no tests either.
+ */
+function checkRunConclusion(status, verdict) {
+  if (status !== 0) return 'failure';
+  return verdict?.skipped === true || verdict?.promptOnly === true ? 'neutral' : 'success';
+}
+
+/** Title and summary for the finished check run, at most a few lines. */
+function checkRunReport(status, verdict, meaning, detailsUrl) {
+  const link = `[Full log](${detailsUrl})`;
+  // Mirrors buildCommentBody's own promptOnly branch. Without it a dry run
+  // renders as a passing verdict with a score of "not recorded" and no
+  // violations, which on a required check is a green light for a review that
+  // never happened.
+  if (status === 0 && verdict?.promptOnly === true) {
+    return {
+      title: 'No review performed',
+      summary: `The CLI ran with \`--agent none\`, so it built the prompt and stopped. This is a dry run, not a verdict.\n\n${link}`,
+    };
+  }
+  if (status === 0 && verdict?.skipped === true) {
+    return {
+      title: 'Skipped',
+      summary: `No changed test files to review: ${verdict.reason ?? 'nothing in the diff to review'}.\n\n${link}`,
+    };
+  }
+  if (status === 0 || status === 1) {
+    const outputs = outputsFromVerdict(verdict);
+    const score = outputs['quality-score'] === '' ? 'not recorded' : `${outputs['quality-score']}/100`;
+    const counts = `${outputs.critical} critical, ${outputs.high} high, ${outputs.medium} medium, ${outputs.low} low`;
+    const waived = status === 0 && verdict?.waived === true ? `\n\nVerdict failure waived: ${verdict.waiveReason ?? 'no reason recorded'}.` : '';
+    return {
+      title: outputs.recommendation === '' ? meaning : outputs.recommendation,
+      summary: `Gating quality score ${score} across ${outputs['reviewed-files']} reviewed file(s).\n\n${counts}.${waived}\n\n${link}`,
+    };
+  }
+  return {
+    title: 'Broken gate',
+    summary: `The review did not produce a verdict: ${meaning}. Treat this as a broken gate, not as approved tests.\n\n${link}`,
+  };
+}
+
 function readJsonIfPresent(file) {
   try {
     if (!fs.existsSync(file)) return null;
@@ -966,7 +1218,7 @@ function runReviewCli(opts, args, commandRunner = runCommand) {
  * rather than reviewing the wrong set: pass base-ref explicitly to bypass the
  * lookup.
  */
-async function resolveRunBaseRef({ baseRef, token, apiUrl }, payload, env = process.env) {
+async function resolveRunBaseRef({ baseRef, token, apiUrl, prCache }, payload, env = process.env) {
   const stated = getInput('base-ref', env) !== '' || String(env.GITHUB_BASE_REF || '').trim() !== '';
   if (stated) return baseRef;
 
@@ -985,7 +1237,7 @@ async function resolveRunBaseRef({ baseRef, token, apiUrl }, payload, env = proc
 
   let pr;
   try {
-    pr = await githubRequest({ apiUrl, token, method: 'GET', path: `/repos/${repo.owner}/${repo.repo}/pulls/${prNumber}` });
+    pr = await fetchPullRequest({ token, apiUrl, prCache }, repo, prNumber);
   } catch (err) {
     throw new Error(`cannot resolve the base branch of #${prNumber} from the GitHub API: ${err.message}. ${guidance}`);
   }
@@ -1178,9 +1430,14 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
       extraArgs: parseExtraArgs(getInput('extra-args', env)),
     },
     comment: getBooleanInput('comment', env),
+    checkRun: getBooleanInput('check-run', env),
+    checkRunName: getInput('check-run-name', env) || 'TEA Test Review',
     uploadReport: getBooleanInput('upload-report', env),
     token: getInput('github-token', env),
     apiUrl: getInput('github-api-url', env) || 'https://api.github.com',
+    // Shared by the head-SHA lookup and the base-ref lookup so the pull
+    // request is fetched once rather than once per caller.
+    prCache: new Map(),
     workspace: env.GITHUB_WORKSPACE || process.cwd(),
   };
 }
@@ -1255,17 +1512,44 @@ async function run() {
     focus: trigger.focus,
   });
 
+  const repo = parseRepository(process.env);
+  const ctx = repo && opts.token ? { owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl } : null;
+
   // React first, before resolveRunBaseRef or anything else that can be slow
   // or fail: the point is to prove the mention was received while the
   // reviewer is still watching, not to summarize what already happened.
-  if (trigger.via === 'mention' && opts.comment && opts.token) {
-    const repo = parseRepository(process.env);
+  if (trigger.via === 'mention' && opts.comment && ctx) {
     const commentId = payload?.comment?.id;
-    if (repo && commentId != null) {
-      await addReaction({ owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl }, commentId, 'eyes');
-    }
+    if (commentId != null) await addReaction(ctx, commentId, 'eyes');
   }
 
+  // Opened before resolveRunBaseRef for the same reason the reaction is: a
+  // base ref that cannot be resolved is exactly the failure a reviewer needs
+  // to see on the pull request rather than in a log nobody opened.
+  let checkRunId = await openCheckRun(opts, ctx, repo, payload);
+
+  // Closing clears the id, so a throw after the close cannot overwrite a
+  // finished conclusion with `failure` from the catch below.
+  const closeCheckRun = async (report) => {
+    const id = checkRunId;
+    checkRunId = null;
+    await completeCheckRun(ctx, id, report);
+  };
+
+  try {
+    return await review(opts, trigger, payload, closeCheckRun);
+  } catch (err) {
+    const reason = err && err.message ? err.message : String(err);
+    await closeCheckRun({
+      ...checkRunReport(2, null, reason, workflowRunUrl()),
+      conclusion: 'failure',
+    });
+    throw err;
+  }
+}
+
+/** The review itself. `closeCheckRun` is called with the finished report exactly once. */
+async function review(opts, trigger, payload, closeCheckRun) {
   opts.baseRef = await resolveRunBaseRef(opts, payload);
   // Set as early as possible, and before anything that can fail below: the
   // composite action's artifact-upload step reads this to name the artifact
@@ -1321,6 +1605,10 @@ async function run() {
 
   const meaning = EXIT_MEANING[status] || `unexpected exit code ${status}`;
   await publishComment(opts, verdict, `exit ${status} (${meaning})`);
+  await closeCheckRun({
+    ...checkRunReport(status, verdict, meaning, workflowRunUrl()),
+    conclusion: checkRunConclusion(status, verdict),
+  });
 
   if (status === 0) {
     if (verdict?.skipped) notice(`Review skipped: ${verdict.reason ?? 'no changed test files'}.`);
@@ -1389,6 +1677,16 @@ module.exports = {
   githubRequest,
   upsertComment,
   addReaction,
+  fetchPullRequest,
+  findOpenCheckRun,
+  openCheckRun,
+  clampBytes,
+  retryAfterMs,
+  resolveHeadSha,
+  createCheckRun,
+  completeCheckRun,
+  checkRunConclusion,
+  checkRunReport,
   buildOptions,
   runReviewCli,
 };

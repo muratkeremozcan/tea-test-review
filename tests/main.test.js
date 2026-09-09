@@ -917,6 +917,41 @@ describe('action.yml defaults', () => {
     assert.deepStrictEqual(opts.cli.agentArgs, ['-c', 'model_reasoning_effort=low']);
   });
 
+  test('check-run defaults to true, so a mention-triggered review is visible without extra wiring', () => {
+    // The composite always passes the declared default through, so that is the
+    // env a real run sees. An unset variable falls to false, the safe direction,
+    // the same way comment and upload-report do.
+    assert.strictEqual(declaredDefault('check-run'), 'true');
+    assert.strictEqual(buildWith({ 'INPUT_CHECK-RUN': declaredDefault('check-run') }).checkRun, true);
+    assert.strictEqual(buildWith({ 'INPUT_CHECK-RUN': 'false' }).checkRun, false);
+    assert.strictEqual(buildWith({}).checkRun, false);
+  });
+
+  test('check-run-name is fixed by default, because branch protection matches it exactly', () => {
+    assert.strictEqual(declaredDefault('check-run-name'), 'TEA Test Review');
+    assert.strictEqual(buildWith({}).checkRunName, 'TEA Test Review');
+    assert.strictEqual(buildWith({ 'INPUT_CHECK-RUN-NAME': 'tests' }).checkRunName, 'tests');
+  });
+
+  test('every run gets its own pull request cache, so nothing leaks between them', () => {
+    assert.ok(buildWith({}).prCache instanceof Map);
+    assert.notStrictEqual(buildWith({}).prCache, buildWith({}).prCache);
+  });
+
+  test('every documented workflow grants the permissions the action writes with', () => {
+    // A recipe that is copied verbatim and then fails on a 403 is a broken
+    // recipe, and these are the two writes the action makes.
+    const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
+    const blocks = [...readme.matchAll(/```yaml\n([\s\S]*?)```/g)]
+      .map((m) => m[1])
+      .filter((b) => /^on:/m.test(b) && /uses: muratkeremozcan\/tea-test-review/.test(b));
+    assert.ok(blocks.length >= 3, `expected the proven configurations, saw ${blocks.length}`);
+    for (const block of blocks) {
+      assert.match(block, /pull-requests: write/);
+      assert.match(block, /checks: write/);
+    }
+  });
+
   test("the three TEA config keys default to empty, so the CLI's own resolution stands", () => {
     for (const name of ['use-playwright-utils', 'use-pactjs-utils', 'pact-mcp']) {
       assert.strictEqual(declaredDefault(name), '', name);
@@ -937,7 +972,7 @@ describe('action.yml defaults', () => {
     for (const name of read) {
       assert.match(ACTION_YML, new RegExp(`^  ${name}:$`, 'm'), `action.yml is missing input ${name}`);
     }
-    assert.ok(read.size >= 18, `expected the full input surface, saw ${read.size}`);
+    assert.ok(read.size >= 34, `expected the full input surface, saw ${read.size}`);
   });
 
   test('every output main.js sets is declared in action.yml', () => {
@@ -993,7 +1028,7 @@ describe('action.yml defaults', () => {
     // but not mapped is silently always its default.
     const inputsSection = ACTION_YML.slice(ACTION_YML.indexOf('\ninputs:'), ACTION_YML.indexOf('\noutputs:'));
     const declared = [...inputsSection.matchAll(/^  ([a-z-]+):$/gm)].map((m) => m[1]);
-    assert.ok(declared.length >= 25, `expected the full input surface, saw ${declared.length}`);
+    assert.ok(declared.length >= 34, `expected the full input surface, saw ${declared.length}`);
     for (const name of declared) {
       const envName = `INPUT_${name.toUpperCase()}`;
       assert.match(ACTION_YML, new RegExp(`^        ${envName}: \\$\\{\\{ inputs\\.${name} \\}\\}$`, 'm'), `composite step does not map ${name}`);
@@ -1731,7 +1766,664 @@ describe('addReaction', () => {
     assert.match(logged, /::warning::Could not react to the triggering comment/);
   });
 });
+// ─── check run ────────────────────────────────────────────────────────────────
+//
+// Shared shims for the check-run suites. The response literal was inlined a
+// dozen times before, with the status and the text body drifting between
+// copies; the file's own habit is a named helper (declaredDefault, buildWith).
 
+const ghOk = (body, status = 200) => ({ ok: true, status, json: async () => body, text: async () => JSON.stringify(body) });
+const ghErr = (status, text = 'boom') => ({ ok: false, status, json: async () => null, text: async () => text });
+const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const RUN_URL = 'https://github.com/o/r/actions/runs/9';
+
+/** Run fn with stdout captured, restoring the real one even when fn throws. */
+async function captureStdout(fn) {
+  const original = process.stdout.write;
+  let logged = '';
+  process.stdout.write = (msg) => {
+    logged += msg;
+    return true;
+  };
+  try {
+    await fn();
+  } finally {
+    process.stdout.write = original;
+  }
+  return logged;
+}
+
+describe('fetchPullRequest', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const repo = { owner: 'o', repo: 'r' };
+  const makeOpts = () => ({ token: 't', apiUrl: 'https://api.github.com', prCache: new Map() });
+
+  test('fetches once and serves every later caller from the cache', async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ghOk({ number: 7, calls });
+    };
+    const opts = makeOpts();
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { number: 7, calls: 1 });
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { number: 7, calls: 1 });
+    assert.strictEqual(calls, 1);
+  });
+
+  test('a different pull request is a different cache entry', async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ghOk({ n: calls });
+    };
+    const opts = makeOpts();
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { n: 1 });
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 8), { n: 2 });
+    assert.strictEqual(calls, 2);
+  });
+
+  test('the same number in a different repository is a different entry', async () => {
+    // The key carries owner and repo because one action run can be pointed at
+    // another repository through github-api-url and a passed token.
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ghOk({ n: calls });
+    };
+    const opts = makeOpts();
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, { owner: 'o', repo: 'a' }, 7), { n: 1 });
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, { owner: 'o', repo: 'b' }, 7), { n: 2 });
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, { owner: 'p', repo: 'a' }, 7), { n: 3 });
+  });
+
+  test('an unparseable 200 is not cached, so the next caller gets its own request', async () => {
+    // githubRequest yields null for a body it cannot parse. Caching that turned
+    // the base-ref lookup, which used to recover on its own request, into a
+    // guaranteed broken gate.
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return calls === 1
+        ? {
+            ok: true,
+            status: 200,
+            json: async () => {
+              throw new Error('truncated');
+            },
+            text: async () => '',
+          }
+        : ghOk({ number: 7 });
+    };
+    const opts = makeOpts();
+    assert.strictEqual(await action.fetchPullRequest(opts, repo, 7), null);
+    assert.strictEqual(opts.prCache.size, 0);
+    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { number: 7 });
+    assert.strictEqual(calls, 2);
+  });
+
+  test('a thrown request caches nothing, so a transient failure is retried', async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ghErr(404, 'gone');
+    };
+    const opts = makeOpts();
+    await assert.rejects(action.fetchPullRequest(opts, repo, 7));
+    assert.strictEqual(opts.prCache.size, 0);
+  });
+
+  test('no cache still works, so an existing caller that passes none is unchanged', async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ghOk({ number: 7 });
+    };
+    const opts = { token: 't', apiUrl: 'https://api.github.com' };
+    await action.fetchPullRequest(opts, repo, 7);
+    await action.fetchPullRequest(opts, repo, 7);
+    assert.strictEqual(calls, 2);
+  });
+
+  test('the head-SHA lookup and the base-ref lookup share one API call', async () => {
+    // This is the cache's whole reason for existing: resolveRunBaseRef already
+    // made this request, and the check run needed the head SHA off the same body.
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return ghOk({ head: { sha: 'abc123' }, base: { ref: 'release/2.0' } });
+    };
+    const opts = { baseRef: 'origin/main', token: 't', apiUrl: 'https://api.github.com', prCache: new Map() };
+    assert.strictEqual(await action.resolveHeadSha(opts, repo, 7, null), 'abc123');
+    assert.strictEqual(
+      await action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
+      'origin/release/2.0'
+    );
+    assert.strictEqual(calls, 1);
+  });
+});
+
+describe('resolveHeadSha', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const repo = { owner: 'o', repo: 'r' };
+  const makeOpts = () => ({ token: 't', apiUrl: 'https://api.github.com', prCache: new Map() });
+
+  test('prefers the head SHA already in a pull_request payload, with no API call', async () => {
+    global.fetch = async () => {
+      throw new Error('the payload already had it');
+    };
+    const payload = { pull_request: { head: { sha: 'abc123' } } };
+    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, payload), 'abc123');
+  });
+
+  test('falls back to the pulls API when the payload carries no commit', async () => {
+    let seen;
+    global.fetch = async (url) => {
+      seen = url;
+      return ghOk({ head: { sha: 'deadbee' } });
+    };
+    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, { issue: { number: 7 } }), 'deadbee');
+    assert.strictEqual(seen, 'https://api.github.com/repos/o/r/pulls/7');
+  });
+
+  test('a pull request with no head SHA is null, never a partial string', async () => {
+    global.fetch = async () => ghOk({ head: {} });
+    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, null), null);
+  });
+
+  test('a non-string head SHA is null, so no check run is aimed at a number', async () => {
+    global.fetch = async () => ghOk({ head: { sha: 123 } });
+    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, null), null);
+  });
+
+  test('an empty head SHA in the payload falls through to the API, not into a blank check run', async () => {
+    global.fetch = async () => ghOk({ head: { sha: 'fromapi' } });
+    const payload = { pull_request: { head: { sha: '' } } };
+    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, payload), 'fromapi');
+  });
+
+  test('a 404 rejects, which is the rejection openCheckRun absorbs', async () => {
+    global.fetch = async () => ghErr(404, 'not found');
+    await assert.rejects(action.resolveHeadSha(makeOpts(), repo, 7, null), /404/);
+  });
+});
+
+describe('findOpenCheckRun', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
+
+  test('queries the commit by check name and returns the id still in flight', async () => {
+    let seen;
+    global.fetch = async (url) => {
+      seen = url;
+      return ghOk({ check_runs: [{ id: 1, status: 'completed' }, { id: 2, status: 'in_progress' }] });
+    };
+    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'TEA Test Review (claude)'), 2);
+    assert.strictEqual(
+      seen,
+      'https://api.github.com/repos/o/r/commits/abc123/check-runs?check_name=TEA%20Test%20Review%20(claude)&per_page=100'
+    );
+  });
+
+  test('a queued run counts as open, so a stalled attempt is adopted rather than duplicated', async () => {
+    global.fetch = async () => ghOk({ check_runs: [{ id: 3, status: 'queued' }] });
+    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), 3);
+  });
+
+  test('only completed runs means nothing to adopt', async () => {
+    global.fetch = async () => ghOk({ check_runs: [{ id: 1, status: 'completed' }] });
+    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), null);
+  });
+
+  test('an open run with no integer id is skipped, so no PATCH is aimed at a guess', async () => {
+    global.fetch = async () => ghOk({ check_runs: [{ id: 'x', status: 'in_progress' }] });
+    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), null);
+  });
+
+  test('a malformed response is null, never a guessed id', async () => {
+    global.fetch = async () => ghOk({});
+    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), null);
+  });
+});
+
+describe('createCheckRun', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
+
+  /** Answers the adopt-or-create GET with `check_runs`, and every other call with `body`. */
+  const stub = (calls, body, { existing = [] } = {}) => async (url, init) => {
+    calls.push({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    return init.method === 'GET' ? ghOk({ check_runs: existing }) : ghOk(body, 201);
+  };
+
+  test('opens the run as in_progress against the head SHA and returns its id', async () => {
+    const calls = [];
+    global.fetch = stub(calls, { id: 55 });
+    const id = await action.createCheckRun(ctx, {
+      headSha: 'abc123',
+      name: 'TEA Test Review (claude)',
+      detailsUrl: RUN_URL,
+    });
+    assert.strictEqual(id, 55);
+    assert.strictEqual(calls.length, 2, 'one adopt-or-create lookup, then one create');
+    assert.strictEqual(calls[1].url, 'https://api.github.com/repos/o/r/check-runs');
+    assert.strictEqual(calls[1].method, 'POST');
+    assert.strictEqual(calls[1].body.head_sha, 'abc123');
+    assert.strictEqual(calls[1].body.status, 'in_progress');
+    assert.strictEqual(calls[1].body.name, 'TEA Test Review (claude)');
+    assert.strictEqual(calls[1].body.details_url, RUN_URL);
+    // A malformed timestamp is a 422 the caller then swallows as a warning, so
+    // the failure mode of getting this wrong is a silently missing check run.
+    assert.match(calls[1].body.started_at, ISO_8601);
+  });
+
+  test('the in-progress output is what the pull request shows for the whole run', async () => {
+    const calls = [];
+    global.fetch = stub(calls, { id: 55 });
+    await action.createCheckRun(ctx, { headSha: 'abc123', name: 'n', detailsUrl: RUN_URL });
+    assert.deepStrictEqual(calls[1].body.output, {
+      title: 'Review in progress',
+      summary: `The TEA test review is running. [Live log](${RUN_URL})`,
+    });
+  });
+
+  test('adopts a run an earlier attempt left open instead of stacking a second under one name', async () => {
+    const calls = [];
+    global.fetch = stub(calls, { id: 99 }, { existing: [{ id: 7, status: 'in_progress' }] });
+    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'abc123', name: 'n', detailsUrl: 'u' }), 7);
+    assert.strictEqual(calls.length, 1, 'the create must not run when an open run was adopted');
+  });
+
+  test('a failed lookup still creates, so the adopt path can never cost the check run', async () => {
+    const calls = [];
+    global.fetch = async (url, init) => {
+      calls.push(init.method);
+      return init.method === 'GET' ? ghErr(403, 'nope') : ghOk({ id: 55 }, 201);
+    };
+    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' }), 55);
+    assert.deepStrictEqual(calls, ['GET', 'POST']);
+  });
+
+  test('a response with no id is null, so nothing is later patched by guess', async () => {
+    global.fetch = stub([], {});
+    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' }), null);
+  });
+
+  test('a non-integer id is null, for the same reason', async () => {
+    global.fetch = stub([], { id: '55' });
+    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' }), null);
+  });
+
+  test('a 403 on the missing permission warns and returns null: cosmetic, never throws', async () => {
+    global.fetch = async () => ghErr(403, 'Resource not accessible');
+    let id;
+    const logged = await captureStdout(async () => {
+      id = await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' });
+    });
+    assert.strictEqual(id, null);
+    assert.match(logged, /::warning::Could not create the check run/);
+    assert.match(logged, /checks: write/);
+  });
+});
+
+describe('completeCheckRun', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
+
+  test('patches the run to completed with its conclusion and output', async () => {
+    const calls = [];
+    global.fetch = async (url, init) => {
+      calls.push({ url, method: init.method, body: JSON.parse(init.body) });
+      return ghOk({ id: 55 });
+    };
+    await action.completeCheckRun(ctx, 55, { conclusion: 'success', title: 'Approve', summary: 'all good' });
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].url, 'https://api.github.com/repos/o/r/check-runs/55');
+    assert.strictEqual(calls[0].method, 'PATCH');
+    assert.strictEqual(calls[0].body.status, 'completed');
+    assert.strictEqual(calls[0].body.conclusion, 'success');
+    assert.deepStrictEqual(calls[0].body.output, { title: 'Approve', summary: 'all good' });
+    assert.match(calls[0].body.completed_at, ISO_8601);
+  });
+
+  test('a null id is a no-op, so a run that was never opened is never patched', async () => {
+    let called = false;
+    global.fetch = async () => {
+      called = true;
+      return ghOk({});
+    };
+    await action.completeCheckRun(ctx, null, { conclusion: 'success', title: 't', summary: 's' });
+    assert.strictEqual(called, false);
+  });
+
+  test('a rejected output is retried bare, so a summary problem cannot pin the run', async () => {
+    const bodies = [];
+    global.fetch = async (url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      return body.output ? ghErr(422, 'output too large') : ghOk({ id: 55 });
+    };
+    const logged = await captureStdout(() =>
+      action.completeCheckRun(ctx, 55, { conclusion: 'failure', title: 't', summary: 's' })
+    );
+    assert.strictEqual(bodies.length, 2);
+    assert.strictEqual(bodies[1].status, 'completed');
+    assert.strictEqual(bodies[1].conclusion, 'failure');
+    assert.strictEqual(bodies[1].output, undefined);
+    assert.match(bodies[1].completed_at, ISO_8601);
+    assert.match(logged, /::warning::Could not write the check run's summary/);
+  });
+
+  test('both attempts failing warns that the run stays open, and still never throws', async () => {
+    global.fetch = async () => ghErr(404, 'gone');
+    const logged = await captureStdout(() =>
+      action.completeCheckRun(ctx, 55, { conclusion: 'success', title: 't', summary: 's' })
+    );
+    assert.match(logged, /::warning::Could not complete the check run/);
+    assert.match(logged, /stays in progress/);
+  });
+});
+
+describe('openCheckRun', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const repo = { owner: 'o', repo: 'r' };
+  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
+  const makeOpts = (over = {}) => ({
+    checkRun: true,
+    checkRunName: 'TEA Test Review',
+    token: 't',
+    apiUrl: 'https://api.github.com',
+    prCache: new Map(),
+    agent: { key: 'claude' },
+    ...over,
+  });
+  const env = { GITHUB_SERVER_URL: 'https://github.com', GITHUB_REPOSITORY: 'o/r', GITHUB_RUN_ID: '9' };
+
+  const openWith = (opts, payload, over = {}) => {
+    const bodies = [];
+    global.fetch = async (url, init) => {
+      if (init.method === 'GET') return ghOk({ check_runs: [] });
+      bodies.push(JSON.parse(init.body));
+      return ghOk({ id: 55 }, 201);
+    };
+    return { bodies, run: () => action.openCheckRun(opts, ctx, repo, payload, { ...env, ...over }) };
+  };
+
+  test('opens against the payload head SHA and links this workflow run', async () => {
+    const { bodies, run } = openWith(makeOpts(), { pull_request: { number: 4, head: { sha: 'abc123' } } });
+    assert.strictEqual(await run(), 55);
+    assert.strictEqual(bodies[0].name, 'TEA Test Review');
+    assert.strictEqual(bodies[0].details_url, RUN_URL);
+    assert.strictEqual(bodies[0].head_sha, 'abc123');
+  });
+
+  test('the name never moves with the agent, because branch protection matches it exactly', async () => {
+    // A mention can switch vendors mid-pull-request. A name carrying the vendor
+    // would stop reporting under the name that was required.
+    const a = openWith(makeOpts(), { pull_request: { number: 4, head: { sha: 'abc' } } });
+    await a.run();
+    const b = openWith(makeOpts({ agent: { key: 'codex' } }), { pull_request: { number: 4, head: { sha: 'abc' } } });
+    await b.run();
+    assert.strictEqual(a.bodies[0].name, b.bodies[0].name);
+    assert.match(a.bodies[0].output.summary, /running on claude\./);
+    assert.match(b.bodies[0].output.summary, /running on codex\./);
+  });
+
+  test('a caller-set name wins, so two reviews in one workflow do not share a run', async () => {
+    const { bodies, run } = openWith(makeOpts({ checkRunName: 'TEA Test Review (codex)' }), {
+      pull_request: { number: 4, head: { sha: 'abc' } },
+    });
+    await run();
+    assert.strictEqual(bodies[0].name, 'TEA Test Review (codex)');
+  });
+
+  test('check-run false never touches the API', async () => {
+    let called = false;
+    global.fetch = async () => {
+      called = true;
+      return ghOk({});
+    };
+    assert.strictEqual(await action.openCheckRun(makeOpts({ checkRun: false }), ctx, repo, {}, env), null);
+    assert.strictEqual(called, false);
+  });
+
+  test('an unusable token warns rather than failing silently, matching the comment path', async () => {
+    let called = false;
+    global.fetch = async () => {
+      called = true;
+      return ghOk({});
+    };
+    let id;
+    const logged = await captureStdout(async () => {
+      id = await action.openCheckRun(makeOpts(), null, repo, {}, env);
+    });
+    assert.strictEqual(id, null);
+    assert.strictEqual(called, false);
+    assert.match(logged, /::warning::check-run is enabled but there is no usable github-token/);
+  });
+
+  test('no pull request in context opens nothing', async () => {
+    let called = false;
+    global.fetch = async () => {
+      called = true;
+      return ghOk({});
+    };
+    assert.strictEqual(await action.openCheckRun(makeOpts(), ctx, repo, {}, { ...env, GITHUB_REF: 'refs/heads/main' }), null);
+    assert.strictEqual(called, false);
+  });
+
+  test('a head SHA that cannot be resolved warns and lets the review run without a check', async () => {
+    global.fetch = async () => ghErr(404, 'not found');
+    let id;
+    const logged = await captureStdout(async () => {
+      id = await action.openCheckRun(makeOpts(), ctx, repo, { issue: { number: 4 } }, env);
+    });
+    assert.strictEqual(id, null);
+    assert.match(logged, /::warning::Could not resolve the head SHA of #4/);
+    assert.match(logged, /The review still runs without a check run/);
+  });
+});
+
+describe('clampBytes', () => {
+  test('leaves anything inside the budget untouched', () => {
+    assert.strictEqual(action.clampBytes('short', 100), 'short');
+  });
+
+  test('trims to the budget and says it trimmed', () => {
+    const out = action.clampBytes('x'.repeat(500), 100);
+    assert.ok(Buffer.byteLength(out, 'utf8') <= 100);
+    assert.match(out, /_\(truncated\)_$/);
+  });
+
+  test('counts bytes, because the API limit is bytes and an emoji is four of them', () => {
+    // 30 emoji is 120 bytes and 60 characters: a character-based clamp would
+    // send this through and take a 422.
+    const out = action.clampBytes('🙂'.repeat(30), 60);
+    assert.ok(Buffer.byteLength(out, 'utf8') <= 60);
+  });
+
+  test('never cuts a multi-byte character in half', () => {
+    const out = action.clampBytes('🙂'.repeat(30), 60);
+    assert.ok(!out.includes('\uFFFD'));
+    assert.strictEqual(Buffer.from(out, 'utf8').toString('utf8'), out);
+  });
+
+  test('a null summary is an empty string, never the word "null"', () => {
+    assert.strictEqual(action.clampBytes(null, 100), '');
+  });
+});
+
+describe('retryAfterMs', () => {
+  test('honours the header GitHub sends, because a shorter wait burns another request', () => {
+    assert.strictEqual(action.retryAfterMs({ get: () => '5' }, 1), 5000);
+  });
+
+  test('caps a hostile value so one response cannot stall the job', () => {
+    assert.strictEqual(action.retryAfterMs({ get: () => '99999' }, 1), 60000);
+  });
+
+  test('falls back to the linear backoff when there is no header', () => {
+    assert.strictEqual(action.retryAfterMs({ get: () => null }, 3), 3000);
+    assert.strictEqual(action.retryAfterMs(null, 2), 2000);
+  });
+
+  test('a non-numeric or non-positive header falls back too', () => {
+    assert.strictEqual(action.retryAfterMs({ get: () => 'Wed, 21 Oct 2026 07:28:00 GMT' }, 1), 1000);
+    assert.strictEqual(action.retryAfterMs({ get: () => '0' }, 1), 1000);
+  });
+});
+
+describe('checkRunConclusion', () => {
+  test('a passing verdict is success', () => {
+    assert.strictEqual(action.checkRunConclusion(0, { recommendation: 'Approve' }), 'success');
+  });
+
+  test('a waived failure is still a pass, because the step exited 0', () => {
+    assert.strictEqual(action.checkRunConclusion(0, { waived: true }), 'success');
+  });
+
+  test('a skipped review is neutral: no evidence of quality, and no reason to block', () => {
+    assert.strictEqual(action.checkRunConclusion(0, { skipped: true }), 'neutral');
+  });
+
+  test('a dry run is neutral, because --agent none reviewed nothing', () => {
+    assert.strictEqual(action.checkRunConclusion(0, { promptOnly: true }), 'neutral');
+  });
+
+  test('only a real boolean skips, so a string "true" from a malformed verdict is not one', () => {
+    assert.strictEqual(action.checkRunConclusion(0, { skipped: 'true' }), 'success');
+    assert.strictEqual(action.checkRunConclusion(0, { promptOnly: 'true' }), 'success');
+  });
+
+  test('a verdict failure is failure', () => {
+    assert.strictEqual(action.checkRunConclusion(1, { recommendation: 'Block' }), 'failure');
+  });
+
+  for (const status of [2, 3]) {
+    test(`exit ${status} is a broken gate and is reported as failure, never as a pass`, () => {
+      assert.strictEqual(action.checkRunConclusion(status, null), 'failure');
+    });
+  }
+
+  test('a skipped verdict on a non-zero exit is still failure: the exit code wins', () => {
+    assert.strictEqual(action.checkRunConclusion(3, { skipped: true }), 'failure');
+  });
+
+  test('a missing verdict on exit 0 is success, matching the step it mirrors', () => {
+    assert.strictEqual(action.checkRunConclusion(0, null), 'success');
+  });
+});
+
+describe('checkRunReport', () => {
+  const link = `[Full log](${RUN_URL})`;
+
+  test('a skipped review names the reason and links the run', () => {
+    const out = action.checkRunReport(0, { skipped: true, reason: 'no changed test files' }, 'success', RUN_URL);
+    assert.strictEqual(out.title, 'Skipped');
+    assert.strictEqual(out.summary, `No changed test files to review: no changed test files.\n\n${link}`);
+  });
+
+  test('a skip with no reason still reads as a skip, never as "undefined"', () => {
+    const out = action.checkRunReport(0, { skipped: true }, 'success', RUN_URL);
+    assert.strictEqual(out.summary, `No changed test files to review: nothing in the diff to review.\n\n${link}`);
+  });
+
+  test('a dry run says no review happened, never a score of zero violations', () => {
+    const out = action.checkRunReport(0, { promptOnly: true, files: ['a.test.ts'] }, 'review passed', RUN_URL);
+    assert.strictEqual(out.title, 'No review performed');
+    assert.strictEqual(
+      out.summary,
+      'The CLI ran with `--agent none`, so it built the prompt and stopped. This is a dry run, not a verdict.' +
+        `\n\n${link}`
+    );
+  });
+
+  test('a passing verdict carries the recommendation, the gating score and the counts', () => {
+    const out = action.checkRunReport(
+      0,
+      {
+        recommendation: 'Approve',
+        gatingQualityScore: 92,
+        gatingViolations: { critical: 0, high: 1, medium: 2, low: 3 },
+        reviewedFiles: ['a.test.ts', 'b.test.ts'],
+      },
+      'success',
+      RUN_URL
+    );
+    assert.strictEqual(out.title, 'Approve');
+    assert.strictEqual(
+      out.summary,
+      `Gating quality score 92/100 across 2 reviewed file(s).\n\n0 critical, 1 high, 2 medium, 3 low.\n\n${link}`
+    );
+  });
+
+  test('a gating score of 0 is reported as 0, the falsiest valid score there is', () => {
+    const out = action.checkRunReport(1, { recommendation: 'Block', gatingQualityScore: 0 }, 'verdict failure', RUN_URL);
+    assert.match(out.summary, /^Gating quality score 0\/100 /);
+  });
+
+  test('a waived failure says so, so a green check is never unexplained', () => {
+    const out = action.checkRunReport(0, { recommendation: 'Approve', waived: true, waiveReason: 'hotfix' }, 'success', RUN_URL);
+    assert.match(out.summary, /Verdict failure waived: hotfix\./);
+  });
+
+  test('a waiver with no reason still reads as a waiver', () => {
+    const out = action.checkRunReport(0, { recommendation: 'Approve', waived: true }, 'success', RUN_URL);
+    assert.match(out.summary, /Verdict failure waived: no reason recorded\./);
+  });
+
+  test('a waiver is never claimed on a failing exit, because a waived run exits 0', () => {
+    const out = action.checkRunReport(1, { recommendation: 'Block', waived: true, waiveReason: 'hotfix' }, 'verdict failure', RUN_URL);
+    assert.ok(!out.summary.includes('waived'));
+  });
+
+  test('a verdict failure keeps its recommendation as the title', () => {
+    const out = action.checkRunReport(1, { recommendation: 'Request Changes', gatingQualityScore: 41 }, 'verdict failure', RUN_URL);
+    assert.strictEqual(out.title, 'Request Changes');
+    assert.match(out.summary, /^Gating quality score 41\/100 /);
+  });
+
+  test('a broken gate is reported as broken rather than as a low score', () => {
+    const out = action.checkRunReport(3, null, 'agent or report failure', RUN_URL);
+    assert.strictEqual(out.title, 'Broken gate');
+    assert.strictEqual(
+      out.summary,
+      `The review did not produce a verdict: agent or report failure. Treat this as a broken gate, not as approved tests.\n\n${link}`
+    );
+  });
+
+  test('an unreadable verdict on exit 1 falls back to the exit meaning for a title', () => {
+    const out = action.checkRunReport(1, null, 'verdict failure', RUN_URL);
+    assert.strictEqual(out.title, 'verdict failure');
+    assert.strictEqual(
+      out.summary,
+      `Gating quality score not recorded across 0 reviewed file(s).\n\n0 critical, 0 high, 0 medium, 0 low.\n\n${link}`
+    );
+  });
+});
 describe('fenceLeadingFrontmatter', () => {
   test('fences a leading frontmatter block and leaves the body untouched', () => {
     const out = action.fenceLeadingFrontmatter("---\na: 1\nb: 2\n---\n\n# Title\n\ntext\n");
