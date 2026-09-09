@@ -132,7 +132,7 @@ const EXIT_MEANING = {
  *
  * Adding a vendor the CLI *does* know natively (i.e. a new key in its own
  * cli/lib/agent-adapters.js) is still an edit here: a new AGENTS entry plus
- * the version input that pins it in action.yml/buildOptions.
+ * the version input that selects it in action.yml/buildOptions.
  */
 const AGENTS = {
   claude: {
@@ -154,11 +154,11 @@ const AGENTS = {
     // Already in the CLI's codex adapter envNames (cli/lib/agent-adapters.js),
     // so no --env-pass needed, same reasoning as claude.
     needsEnvPass: false,
-    // codex 0.146.0 does not read OPENAI_API_KEY from the environment; it
-    // authenticates only from ~/.codex/auth.json, which no runner has. Passing
-    // the variable alone sends no credential at all and the run dies on
-    // "Missing bearer or basic authentication in header". This writes the file
-    // first. The key travels on stdin, never argv, so it stays out of the log.
+    // codex does not read OPENAI_API_KEY from the environment; it authenticates
+    // only from ~/.codex/auth.json, which no runner has. Passing the variable
+    // alone sends no credential at all and the run dies on "Missing bearer or
+    // basic authentication in header". This writes the file first. The key
+    // travels on stdin, never argv, so it stays out of the log.
     loginArgv: ['login', '--with-api-key'],
   },
 };
@@ -253,8 +253,12 @@ function resolveAgent({ agent, agentPackage, agentCommand, agentKeyEnv, agentVer
   const known = AGENTS[key];
 
   if (known) {
-    const pinnedVersion = agentVersions[key];
-    const packageSpec = agentPackage || (pinnedVersion ? `${known.package}@${pinnedVersion}` : known.package);
+    // Defaults to `latest` in buildOptions, so the common spec is
+    // `<package>@latest`; a caller pinning the input lands here too. An empty
+    // value falls back to the bare package name, which npm resolves the same
+    // way, so no path can compose a spec ending in `@`.
+    const version = agentVersions[key];
+    const packageSpec = agentPackage || (version ? `${known.package}@${version}` : known.package);
     return {
       key,
       cliAgent: key,
@@ -1131,8 +1135,8 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
     agentCommand: getInput('agent-command', env),
     agentKeyEnv: getInput('agent-key-env', env),
     agentVersions: {
-      claude: getInput('claude-code-version', env) || '2.1.220',
-      codex: getInput('codex-version', env) || '0.146.0',
+      claude: getInput('claude-code-version', env) || 'latest',
+      codex: getInput('codex-version', env) || 'latest',
     },
   });
 

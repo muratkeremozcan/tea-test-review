@@ -147,7 +147,7 @@ inputs:
     required: false
     default: ''
 
-  # ─── pinned versions ────────────────────────────────────────────────────────
+  # ─── dependency versions ────────────────────────────────────────────────────
   tea-version:
     description: |
       Version or dist-tag of bmad-method-test-architecture-enterprise supplying
@@ -165,13 +165,22 @@ inputs:
     required: false
     default: 'latest'
   claude-code-version:
-    description: 'Exact version of @anthropic-ai/claude-code to install. Pinned for the same reason as tea-version.'
+    description: |
+      Version or dist-tag of @anthropic-ai/claude-code to install. Defaults to
+      `latest`, the same as tea-version, so the agent CLI follows its newest
+      published release and no one maintains a pin here.
+
+      Pin an exact version when you need a reproducible verdict or a vendor
+      release breaks a run.
     required: false
-    default: '2.1.220'
+    default: 'latest'
   codex-version:
-    description: 'Exact version of @openai/codex to install, for `agent: codex`. Pinned for the same reason as tea-version.'
+    description: |
+      Version or dist-tag of @openai/codex to install, for `agent: codex`.
+      Defaults to `latest` on the same terms as claude-code-version, and takes
+      an exact version when you need to pin one.
     required: false
-    default: '0.146.0'
+    default: 'latest'
 
   # ─── review scope ───────────────────────────────────────────────────────────
   base-ref:
