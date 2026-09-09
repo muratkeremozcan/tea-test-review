@@ -401,13 +401,13 @@ not a floating-tag move on the current major.
 `agent` defaults to `claude`. `codex` is built in: the CLI's adapter table
 ([`cli/lib/agent-adapters.js`](https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise/blob/main/cli/lib/agent-adapters.js))
 spawns it natively (`codex exec --sandbox workspace-write`), so the action
-passes `agent` straight through as `--agent` and installs `@openai/codex`,
-pinned by `codex-version`.
+passes `agent` straight through as `--agent` and installs `@openai/codex` at
+whatever `codex-version` resolves to, `latest` by default.
 
-codex needs two things claude does not, and the action does both. codex
-0.146.0 never reads `OPENAI_API_KEY` from the environment and authenticates
-only from `~/.codex/auth.json`, which no runner has; handed only the
-variable, the run dies on
+codex needs two things claude does not, and the action does both. codex never
+reads `OPENAI_API_KEY` from the environment and authenticates only from
+`~/.codex/auth.json`, which no runner has; handed only the variable, the run
+dies on
 `401 ... Missing bearer or basic authentication in header`. The action pipes
 the key into `codex login --with-api-key` on stdin, never argv, so the
 credential reaches disk without reaching the workflow log. And on
@@ -447,14 +447,14 @@ vendors get the login step above.
 
 ## Important behavior
 
-- The review skill is unpacked from the pinned npm tarball into a temp
-  directory outside the checkout and passed as `--skill-root`, so a pull
-  request that edits its own vendored `_bmad/` copy cannot rewrite the
-  reviewer that judges it. The residual trust is the pinned version as
-  published: vet it once, pin it exactly, bump it deliberately.
-- `claude-code-version` and `codex-version` are exact pins because a vendor
-  CLI changes its own behaviour under you; `tea-version` follows the newest
-  release so callers do not carry a bump.
+- The review skill is unpacked from the npm tarball into a temp directory
+  outside the checkout and passed as `--skill-root`, so a pull request that
+  edits its own vendored `_bmad/` copy cannot rewrite the reviewer that judges
+  it. The residual trust is whatever version installs: set `tea-version` to an
+  exact release when you want to vet it once and bump it deliberately.
+- `tea-version`, `claude-code-version` and `codex-version` all default to
+  `latest`, so callers carry no bump. Each takes an exact version when a run
+  has to be reproducible or a vendor release breaks it.
 - The comment is upserted on a hidden marker, so ten pushes update one
   comment. A comment that cannot be written is a warning and never changes
   the verdict.

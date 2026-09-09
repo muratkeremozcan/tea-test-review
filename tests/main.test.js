@@ -461,7 +461,7 @@ describe('agentLogin', () => {
     assert.deepStrictEqual(
       agent.loginArgv,
       ['login', '--with-api-key'],
-      'codex 0.146.0 authenticates only from ~/.codex/auth.json, which no runner has'
+      'codex authenticates only from ~/.codex/auth.json, which no runner has'
     );
   });
 
@@ -494,11 +494,11 @@ describe('agentLogin', () => {
 });
 
 describe('resolveAgent', () => {
-  test('claude is built in and pins from claude-code-version', () => {
-    const agent = action.resolveAgent({ agent: 'claude', agentVersions: { claude: '2.1.220' } });
+  test('claude is built in and takes its version from claude-code-version', () => {
+    const agent = action.resolveAgent({ agent: 'claude', agentVersions: { claude: 'latest' } });
     assert.strictEqual(agent.key, 'claude');
     assert.strictEqual(agent.cliAgent, 'claude', 'a known vendor is passed straight through as --agent');
-    assert.strictEqual(agent.packageSpec, '@anthropic-ai/claude-code@2.1.220');
+    assert.strictEqual(agent.packageSpec, '@anthropic-ai/claude-code@latest');
     assert.strictEqual(agent.command, 'claude');
     assert.strictEqual(agent.verified, true);
     // Both claude variables are already in the CLI's BASE_ENV_NAMES.
@@ -506,14 +506,14 @@ describe('resolveAgent', () => {
     assert.deepStrictEqual(agent.credentialEnvNames, ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
   });
 
-  test('codex is built in and pins from codex-version', () => {
+  test('codex is built in and takes its version from codex-version', () => {
     // Second built-in vendor, proven live against a real test file by the
     // review CLI's own cli/lib/agent-adapters.js (codex exec --sandbox
     // workspace-write), not just plumbed through --agent-cmd.
-    const agent = action.resolveAgent({ agent: 'codex', agentVersions: { codex: '0.146.0' } });
+    const agent = action.resolveAgent({ agent: 'codex', agentVersions: { codex: 'latest' } });
     assert.strictEqual(agent.key, 'codex');
     assert.strictEqual(agent.cliAgent, 'codex');
-    assert.strictEqual(agent.packageSpec, '@openai/codex@0.146.0');
+    assert.strictEqual(agent.packageSpec, '@openai/codex@latest');
     assert.strictEqual(agent.command, 'codex');
     assert.strictEqual(agent.verified, true);
     // Already covered by the CLI's own codex adapter envNames, same as claude.
@@ -522,15 +522,38 @@ describe('resolveAgent', () => {
   });
 
   test('an empty agent defaults to claude', () => {
-    assert.strictEqual(action.resolveAgent({ agent: '', agentVersions: { claude: '2.1.220' } }).key, 'claude');
-    assert.strictEqual(action.resolveAgent({ agentVersions: { claude: '2.1.220' } }).key, 'claude');
+    assert.strictEqual(action.resolveAgent({ agent: '', agentVersions: { claude: 'latest' } }).key, 'claude');
+    assert.strictEqual(action.resolveAgent({ agentVersions: { claude: 'latest' } }).key, 'claude');
+  });
+
+  test('a caller can still pin an exact agent version through the input', () => {
+    // The maintained default floats; the ability to pin is what the inputs are for.
+    assert.strictEqual(
+      action.resolveAgent({ agent: 'claude', agentVersions: { claude: '2.1.220' } }).packageSpec,
+      '@anthropic-ai/claude-code@2.1.220'
+    );
+    assert.strictEqual(
+      action.resolveAgent({ agent: 'codex', agentVersions: { codex: '0.146.0' } }).packageSpec,
+      '@openai/codex@0.146.0'
+    );
+  });
+
+  test('an absent agent version composes a spec npm accepts, never one ending in @', () => {
+    // buildOptions falls back to `latest`, so this covers a direct caller of
+    // resolveAgent: a bare package name resolves to latest on install, while a
+    // trailing `@` is not a spec npm can resolve at all.
+    for (const key of ['claude', 'codex']) {
+      const spec = action.resolveAgent({ agent: key, agentVersions: {} }).packageSpec;
+      assert.strictEqual(spec, action.AGENTS[key].package);
+      assert.ok(!spec.endsWith('@'), `${spec} would be an unresolvable npm spec`);
+    }
   });
 
   test('agent-package overrides the built-in spec', () => {
     const agent = action.resolveAgent({
       agent: 'claude',
       agentPackage: '@anthropic-ai/claude-code@2.0.0',
-      agentVersions: { claude: '2.1.220' },
+      agentVersions: { claude: 'latest' },
     });
     assert.strictEqual(agent.packageSpec, '@anthropic-ai/claude-code@2.0.0');
   });
@@ -579,7 +602,7 @@ describe('resolveAgent', () => {
 });
 
 describe('resolveCredential', () => {
-  const claude = action.resolveAgent({ agent: 'claude', agentVersions: { claude: '2.1.220' } });
+  const claude = action.resolveAgent({ agent: 'claude', agentVersions: { claude: 'latest' } });
 
   test('the api key input wins over the environment', () => {
     const credential = action.resolveCredential({ anthropicApiKey: 'from-input' }, claude, {
@@ -608,7 +631,7 @@ describe('resolveCredential', () => {
   });
 
   test('codex resolves its own dedicated input, not the generic custom-vendor one', () => {
-    const codex = action.resolveAgent({ agent: 'codex', agentVersions: { codex: '0.146.0' } });
+    const codex = action.resolveAgent({ agent: 'codex', agentVersions: { codex: 'latest' } });
     assert.deepStrictEqual(action.resolveCredential({ openaiApiKey: 'sk-codex' }, codex, {}), {
       name: 'OPENAI_API_KEY',
       value: 'sk-codex',
@@ -844,13 +867,32 @@ describe('action.yml defaults', () => {
     assert.strictEqual(buildWith({}).teaVersion, declaredDefault('tea-version'));
   });
 
-  test('claude-code-version', () => {
+  test('claude-code-version floats to latest', () => {
+    // The agent CLIs follow tea-version's shape: nobody maintains a pin, and a
+    // caller who needs one passes it through the input.
+    assert.strictEqual(declaredDefault('claude-code-version'), 'latest');
     assert.strictEqual(buildWith({}).agent.packageSpec, `@anthropic-ai/claude-code@${declaredDefault('claude-code-version')}`);
   });
 
-  test('codex-version', () => {
+  test('codex-version floats to latest', () => {
+    assert.strictEqual(declaredDefault('codex-version'), 'latest');
     const opts = action.buildOptions({ INPUT_AGENT: 'codex', 'INPUT_OPENAI-API-KEY': 'sk-test' });
     assert.strictEqual(opts.agent.packageSpec, `@openai/codex@${declaredDefault('codex-version')}`);
+  });
+
+  test('an empty version input behaves like an absent one', () => {
+    // An action called through `with:` sends the input as an empty string when
+    // a caller sets it to nothing, which must not compose a spec ending in `@`.
+    assert.strictEqual(
+      buildWith({ 'INPUT_CLAUDE-CODE-VERSION': '' }).agent.packageSpec,
+      '@anthropic-ai/claude-code@latest'
+    );
+    const codex = action.buildOptions({
+      INPUT_AGENT: 'codex',
+      'INPUT_OPENAI-API-KEY': 'sk-test',
+      'INPUT_CODEX-VERSION': '',
+    });
+    assert.strictEqual(codex.agent.packageSpec, '@openai/codex@latest');
   });
 
   test('report-path and json-path', () => {
