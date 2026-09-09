@@ -19,6 +19,8 @@ Copy one of the two [proven configurations](#proven-configurations) below;
 both ran live end to end against real pull requests. Two requirements:
 
 - `pull-requests: write`, when `comment` is left on.
+- `checks: write`, when `check-run` is left on. Without it the review is
+  invisible on the pull request until it finishes.
 - A credential: `ANTHROPIC_API_KEY` (bills per token through the Anthropic
   Console) or `CLAUDE_CODE_OAUTH_TOKEN` (a long-lived token from
   `claude setup-token`, billed to an existing Claude subscription), as the
