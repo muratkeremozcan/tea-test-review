@@ -916,6 +916,133 @@ async function addReaction(ctx, commentId, content = 'eyes') {
   }
 }
 
+/**
+ * The pull request, fetched at most once per run. Two callers need it (the
+ * base ref an issue_comment run does not carry, and the head SHA the check run
+ * must be keyed to), and a cache keeps that one API call instead of two.
+ */
+async function fetchPullRequest({ token, apiUrl, prCache }, repo, prNumber) {
+  const key = `${repo.owner}/${repo.repo}#${prNumber}`;
+  if (prCache && prCache.has(key)) return prCache.get(key);
+  const pr = await githubRequest({
+    apiUrl,
+    token,
+    method: 'GET',
+    path: `/repos/${repo.owner}/${repo.repo}/pulls/${prNumber}`,
+  });
+  if (prCache) prCache.set(key, pr);
+  return pr;
+}
+
+/**
+ * The pull request's head SHA, which is the only commit its Checks list
+ * renders against. GITHUB_SHA is no substitute: on an issue_comment run it is
+ * the default branch's tip, and on a pull_request run it is the merge commit.
+ * Neither is a commit in the pull request, so a check run keyed to either one
+ * is created successfully and then shows up nowhere.
+ */
+async function resolveHeadSha(opts, repo, prNumber, payload) {
+  const fromPayload = payload?.pull_request?.head?.sha;
+  if (typeof fromPayload === 'string' && fromPayload !== '') return fromPayload;
+  const pr = await fetchPullRequest(opts, repo, prNumber);
+  const sha = pr?.head?.sha;
+  return typeof sha === 'string' && sha !== '' ? sha : null;
+}
+
+/**
+ * Open the check run that makes the review visible while it is still running.
+ * An issue_comment workflow is repository-scoped, so GitHub binds its check
+ * suite to the default branch and the pull request shows nothing at all: for
+ * the ten-plus minutes a review can take, the only signal is the :eyes:
+ * reaction. Never throws, for the same reason the comment never does: the
+ * verdict is the step's exit code, and losing a cosmetic surface must not move
+ * it.
+ */
+async function createCheckRun(ctx, { headSha, name, detailsUrl }) {
+  try {
+    const created = await githubRequest({
+      ...ctx,
+      method: 'POST',
+      path: `/repos/${ctx.owner}/${ctx.repo}/check-runs`,
+      body: {
+        name,
+        head_sha: headSha,
+        status: 'in_progress',
+        started_at: new Date().toISOString(),
+        details_url: detailsUrl,
+        output: {
+          title: 'Review in progress',
+          summary: `The TEA test review is running. [Live log](${detailsUrl})`,
+        },
+      },
+    });
+    return Number.isInteger(created?.id) ? created.id : null;
+  } catch (err) {
+    warn(
+      `Could not create the check run: ${err.message}. The review still runs; this is cosmetic. ` +
+        'Grant the job `checks: write`, and leave github-token as the default GITHUB_TOKEN: the Checks API ' +
+        'rejects a classic personal access token. Set check-run: false to stop trying.'
+    );
+    return null;
+  }
+}
+
+/** Close the check run. Never throws, for the reason createCheckRun does not. */
+async function completeCheckRun(ctx, checkRunId, { conclusion, title, summary }) {
+  if (checkRunId == null) return;
+  try {
+    await githubRequest({
+      ...ctx,
+      method: 'PATCH',
+      path: `/repos/${ctx.owner}/${ctx.repo}/check-runs/${checkRunId}`,
+      body: {
+        status: 'completed',
+        conclusion,
+        completed_at: new Date().toISOString(),
+        output: { title, summary },
+      },
+    });
+  } catch (err) {
+    warn(`Could not complete the check run: ${err.message}. The verdict is unaffected; it is this step's exit code.`);
+  }
+}
+
+/**
+ * The check run mirrors the step's exit code, because two gates that can
+ * disagree are worse than one. `neutral` is reserved for a review that never
+ * ran: a skipped review is no evidence of quality, and it is no reason to
+ * block a pull request that changed no tests either.
+ */
+function checkRunConclusion(status, verdict) {
+  if (status !== 0) return 'failure';
+  return verdict?.skipped === true ? 'neutral' : 'success';
+}
+
+/** Title and summary for the finished check run, at most a few lines. */
+function checkRunReport(status, verdict, meaning, detailsUrl) {
+  const link = `[Full log](${detailsUrl})`;
+  if (status === 0 && verdict?.skipped === true) {
+    return {
+      title: 'Skipped',
+      summary: `No changed test files to review: ${verdict.reason ?? 'nothing in the diff to review'}.\n\n${link}`,
+    };
+  }
+  if (status === 0 || status === 1) {
+    const outputs = outputsFromVerdict(verdict);
+    const score = outputs['quality-score'] === '' ? 'not recorded' : `${outputs['quality-score']}/100`;
+    const counts = `${outputs.critical} critical, ${outputs.high} high, ${outputs.medium} medium, ${outputs.low} low`;
+    const waived = status === 0 && verdict?.waived === true ? `\n\nVerdict failure waived: ${verdict.waiveReason ?? 'no reason recorded'}.` : '';
+    return {
+      title: outputs.recommendation === '' ? meaning : outputs.recommendation,
+      summary: `Gating quality score ${score} across ${outputs['reviewed-files']} reviewed file(s).\n\n${counts}.${waived}\n\n${link}`,
+    };
+  }
+  return {
+    title: 'Broken gate',
+    summary: `The review did not produce a verdict: ${meaning}. Treat this as a broken gate, not as approved tests.\n\n${link}`,
+  };
+}
+
 function readJsonIfPresent(file) {
   try {
     if (!fs.existsSync(file)) return null;
@@ -966,7 +1093,7 @@ function runReviewCli(opts, args, commandRunner = runCommand) {
  * rather than reviewing the wrong set: pass base-ref explicitly to bypass the
  * lookup.
  */
-async function resolveRunBaseRef({ baseRef, token, apiUrl }, payload, env = process.env) {
+async function resolveRunBaseRef({ baseRef, token, apiUrl, prCache }, payload, env = process.env) {
   const stated = getInput('base-ref', env) !== '' || String(env.GITHUB_BASE_REF || '').trim() !== '';
   if (stated) return baseRef;
 
@@ -985,7 +1112,7 @@ async function resolveRunBaseRef({ baseRef, token, apiUrl }, payload, env = proc
 
   let pr;
   try {
-    pr = await githubRequest({ apiUrl, token, method: 'GET', path: `/repos/${repo.owner}/${repo.repo}/pulls/${prNumber}` });
+    pr = await fetchPullRequest({ token, apiUrl, prCache }, repo, prNumber);
   } catch (err) {
     throw new Error(`cannot resolve the base branch of #${prNumber} from the GitHub API: ${err.message}. ${guidance}`);
   }
@@ -1178,9 +1305,13 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
       extraArgs: parseExtraArgs(getInput('extra-args', env)),
     },
     comment: getBooleanInput('comment', env),
+    checkRun: getBooleanInput('check-run', env),
     uploadReport: getBooleanInput('upload-report', env),
     token: getInput('github-token', env),
     apiUrl: getInput('github-api-url', env) || 'https://api.github.com',
+    // Shared by the head-SHA lookup and the base-ref lookup so the pull
+    // request is fetched once rather than once per caller.
+    prCache: new Map(),
     workspace: env.GITHUB_WORKSPACE || process.cwd(),
   };
 }
@@ -1255,17 +1386,54 @@ async function run() {
     focus: trigger.focus,
   });
 
+  const repo = parseRepository(process.env);
+  const ctx = repo && opts.token ? { owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl } : null;
+
   // React first, before resolveRunBaseRef or anything else that can be slow
   // or fail: the point is to prove the mention was received while the
   // reviewer is still watching, not to summarize what already happened.
-  if (trigger.via === 'mention' && opts.comment && opts.token) {
-    const repo = parseRepository(process.env);
+  if (trigger.via === 'mention' && opts.comment && ctx) {
     const commentId = payload?.comment?.id;
-    if (repo && commentId != null) {
-      await addReaction({ owner: repo.owner, repo: repo.repo, token: opts.token, apiUrl: opts.apiUrl }, commentId, 'eyes');
+    if (commentId != null) await addReaction(ctx, commentId, 'eyes');
+  }
+
+  // Opened before resolveRunBaseRef for the same reason the reaction is: a
+  // base ref that cannot be resolved is exactly the failure a reviewer needs
+  // to see on the pull request rather than in a log nobody opened.
+  let checkRunId = null;
+  if (opts.checkRun && ctx) {
+    const prNumber = resolvePrNumber(payload);
+    if (prNumber == null) log('No pull request in context, so there is no commit to attach a check run to.');
+    else {
+      const headSha = await resolveHeadSha(opts, repo, prNumber, payload).catch((err) => {
+        warn(`Could not resolve the head SHA of #${prNumber}: ${err.message}. The review still runs without a check run.`);
+        return null;
+      });
+      if (headSha) {
+        checkRunId = await createCheckRun(ctx, {
+          headSha,
+          name: `TEA Test Review (${opts.agent.key})`,
+          detailsUrl: workflowRunUrl(),
+        });
+      }
     }
   }
 
+  try {
+    return await review(opts, trigger, payload, (report) => completeCheckRun(ctx, checkRunId, report));
+  } catch (err) {
+    await completeCheckRun(ctx, checkRunId, {
+      title: 'Broken gate',
+      conclusion: 'failure',
+      summary: `The review did not produce a verdict: ${err && err.message ? err.message : String(err)}. ` +
+        `Treat this as a broken gate, not as approved tests.\n\n[Full log](${workflowRunUrl()})`,
+    });
+    throw err;
+  }
+}
+
+/** The review itself. `closeCheckRun` is called with the finished report exactly once. */
+async function review(opts, trigger, payload, closeCheckRun) {
   opts.baseRef = await resolveRunBaseRef(opts, payload);
   // Set as early as possible, and before anything that can fail below: the
   // composite action's artifact-upload step reads this to name the artifact
@@ -1321,6 +1489,10 @@ async function run() {
 
   const meaning = EXIT_MEANING[status] || `unexpected exit code ${status}`;
   await publishComment(opts, verdict, `exit ${status} (${meaning})`);
+  await closeCheckRun({
+    ...checkRunReport(status, verdict, meaning, workflowRunUrl()),
+    conclusion: checkRunConclusion(status, verdict),
+  });
 
   if (status === 0) {
     if (verdict?.skipped) notice(`Review skipped: ${verdict.reason ?? 'no changed test files'}.`);
@@ -1389,6 +1561,12 @@ module.exports = {
   githubRequest,
   upsertComment,
   addReaction,
+  fetchPullRequest,
+  resolveHeadSha,
+  createCheckRun,
+  completeCheckRun,
+  checkRunConclusion,
+  checkRunReport,
   buildOptions,
   runReviewCli,
 };

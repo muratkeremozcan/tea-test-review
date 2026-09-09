@@ -299,8 +299,33 @@ inputs:
       neither the reaction nor the comment.
     required: false
     default: 'true'
+  check-run:
+    description: |
+      Publish a check run against the pull request's head commit, opened as
+      `in_progress` before the review starts and closed with its verdict. Needs
+      `checks: write`.
+
+      This is the only way a mention-triggered review is visible while it runs.
+      An `issue_comment` workflow is repository-scoped, so GitHub binds its
+      check suite to the default branch and the pull request's Checks list shows
+      nothing at all for however long the review takes.
+
+      The conclusion mirrors the step's exit code: `success` on a passing
+      verdict, `failure` on a failing one and on a broken gate, `neutral` on a
+      skipped review, which is no evidence of quality and no reason to block a
+      pull request that changed no tests. Safe to require in branch protection,
+      with one caveat: a run killed outright, by a cancel or by the runner
+      itself, leaves the check pinned at `in_progress`, because nothing is left
+      alive to close it.
+
+      A check run that cannot be created is a warning, never a failure, on the
+      same contract as the comment. The Checks API needs a GitHub App
+      installation token: the default GITHUB_TOKEN qualifies and a classic
+      personal access token is rejected with a 403.
+    required: false
+    default: 'true'
   github-token:
-    description: 'Token used to read and write the PR comment. Needs pull-requests: write.'
+    description: 'Token used to read and write the PR comment and check run. Needs pull-requests: write, and checks: write for the check run.'
     required: false
     default: '${{ github.token }}'
   github-api-url:
@@ -449,6 +474,7 @@ runs:
         INPUT_REPORT-PATH: ${{ inputs.report-path }}
         INPUT_JSON-PATH: ${{ inputs.json-path }}
         INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_CHECK-RUN: ${{ inputs.check-run }}
         INPUT_GITHUB-TOKEN: ${{ inputs.github-token }}
         INPUT_GITHUB-API-URL: ${{ inputs.github-api-url }}
         INPUT_UPLOAD-REPORT: ${{ inputs.upload-report }}

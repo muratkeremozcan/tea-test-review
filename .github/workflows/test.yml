@@ -52,6 +52,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # for the live comment write, which is the point of this job
+      checks: write # for the check run, the other live write this job proves
     steps:
       - uses: actions/checkout@v4
         with:
