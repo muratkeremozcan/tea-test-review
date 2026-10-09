@@ -228,8 +228,10 @@ function resolveAgent({ agent, agentPackage, agentCommand, agentKeyEnv, agentVer
 
 /**
  * Pick the credential to inject, an explicit input over the step's own `env:`.
- * A missing credential throws: a required check that quietly passes when it
- * could not run gives no protection, so the fork case is a caller-side `if:`.
+ * None is null, with a warning, rather than an error: the CLI checks that the
+ * agent is installed and logged in before it spends anything, exits 2 with the
+ * remedy when it is not, and publishes that to the pull request, which an
+ * error thrown here could not. A stored login (a self-hosted runner) still works.
  */
 function resolveCredential(inputs, agent, env = process.env) {
   const candidates = agent.verified
@@ -248,11 +250,13 @@ function resolveCredential(inputs, agent, env = process.env) {
   const fromEnv = agent.credentialEnvNames.find((name) => env[name]);
   if (fromEnv) return { name: fromEnv, value: env[fromEnv] };
 
-  throw new Error(
+  warn(
     `no credential for the ${agent.key} agent: set one of ${agent.credentialEnvNames.join(' or ')}, ` +
       'as an input or in the step\'s env. Fork pull requests receive no secrets, so guard this job with ' +
-      "`if: github.event.pull_request.head.repo.full_name == github.repository` on the caller's side."
+      "`if: github.event.pull_request.head.repo.full_name == github.repository` on the caller's side. " +
+      'The review stops with exit 2 unless the agent is already logged in.'
   );
+  return null;
 }
 
 /**
@@ -302,7 +306,10 @@ function buildCliArgs(opts) {
     args.push('--github', '--check-name', opts.checkRunName);
     if (!opts.comment) args.push('--no-pr-comment');
     if (!opts.checkRun) args.push('--no-check-run');
-    valued([['--artifact-name', opts.artifactName]]);
+    valued([
+      ['--artifact-name', opts.artifactName],
+      ['--publish-as', opts.publishAs],
+    ]);
   }
   if (opts.agentCommand !== opts.cliAgent) args.push('--agent-cmd', opts.agentCommand);
   valued([
@@ -405,12 +412,14 @@ function installCli(source, agentSpec, runner = runCommandChecked) {
 
 /**
  * Write the agent's credential to its on-disk auth store, for vendors that
- * refuse the environment (codex today; a no-op without a loginArgv). stdio is
- * piped and the key goes through stdin, so it reaches neither the log nor a
- * process list.
+ * refuse the environment (codex today; a no-op without a loginArgv or without a
+ * credential). stdio is piped and the key goes through stdin, so it reaches
+ * neither the log nor a process list. A login that fails is a warning, not an
+ * error: the CLI then finds the agent logged out or missing, exits 2 with the
+ * remedy, and publishes that as a broken gate.
  */
 function agentLogin(agent, credential) {
-  if (!agent.loginArgv) return;
+  if (!agent.loginArgv || !credential) return;
   log(`+ ${agent.command} ${agent.loginArgv.join(' ')} (credential on stdin)`);
   const result = spawnSync(binaryName(agent.command), agent.loginArgv, {
     input: `${credential.value}\n`,
@@ -419,14 +428,9 @@ function agentLogin(agent, credential) {
   // A fast-exiting login closes stdin early and surfaces EPIPE beside a real
   // `status`; `status == null` is the signal that the process never ran.
   if (result.error && result.status == null) {
-    if (result.error.code === 'ENOENT') throw new Error(`${agent.command} not found on PATH`);
-    throw new Error(`${agent.command} login failed: ${result.error.message}`);
-  }
-  if (result.status !== 0) {
-    throw new Error(
-      `${agent.command} could not accept the ${credential.name} credential (exit ${result.status}). ` +
-        'The review never ran, so this is a broken gate rather than a verdict.'
-    );
+    warn(`${agent.command} login did not run: ${result.error.code === 'ENOENT' ? 'not found on PATH' : result.error.message}.`);
+  } else if (result.status !== 0) {
+    warn(`${agent.command} could not accept the ${credential.name} credential (exit ${result.status}).`);
   }
 }
 
@@ -445,10 +449,11 @@ function assertCliIsCurrent(teaVersion, runner = spawnSync) {
         'Set tea-version to a release that ships the tea-test-review CLI.'
     );
   }
-  if (!/--github\b/.test(String(help.stdout))) {
+  const missing = ['--github', '--publish-as'].filter((flag) => !String(help.stdout).includes(flag));
+  if (missing.length > 0) {
     throw new Error(
-      `${spec} predates the --github publisher this action drives, so its CLI cannot post the comment or the check run. ` +
-        'Set tea-version to a release whose `tea-test-review --help` lists --github.'
+      `${spec} predates ${missing.join(' and ')}, which this action drives, so its CLI cannot post the comment or the check run under the right identity. ` +
+        `Set tea-version to a release whose \`tea-test-review --help\` lists ${missing.join(' and ')}.`
     );
   }
 }
@@ -684,7 +689,9 @@ function planCliArgs(opts, prNumber, env = process.env) {
       jsonPath: opts.jsonPath,
       cliAgent: opts.agent.cliAgent,
       agentCommand: opts.agent.command,
-      envPass: opts.agent.needsEnvPass ? opts.credential.name : '',
+      envPass: opts.agent.needsEnvPass ? opts.agent.credentialEnvNames[0] : '',
+      // A custom vendor runs as --agent claude; its own tag keeps its comment from sharing claude's.
+      publishAs: opts.agent.key === opts.agent.cliAgent ? '' : opts.agent.key,
       comment: opts.comment,
       checkRun: opts.checkRun,
       checkRunName: opts.checkRunName,
@@ -726,7 +733,7 @@ async function run(env = process.env) {
 
   const { plan, args } = planCliArgs(opts, resolvePrNumber(payload, env), env);
   log(`TEA Test Review: ${teaInstallSource(opts.teaVersion)}, agent ${opts.agent.key} (${opts.agent.packageSpec})`);
-  log(`  base ref: ${opts.baseRef || '(resolved by the CLI)'}, credential: ${opts.credential.name}`);
+  log(`  base ref: ${opts.baseRef || '(resolved by the CLI)'}, credential: ${opts.credential?.name ?? '(none)'}`);
   if (trigger.via === 'mention') {
     log(`  triggered by a "${trigger.mention}" comment${trigger.focus ? `, focus: ${trigger.focus}` : ''}`);
   }

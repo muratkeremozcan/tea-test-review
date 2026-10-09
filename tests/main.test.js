@@ -28,6 +28,22 @@ const { spawn } = require('node:child_process');
 
 const action = require('../main.js');
 
+/** Run fn with stdout captured, returning what it printed. */
+function printed(fn) {
+  const original = process.stdout.write;
+  let out = '';
+  process.stdout.write = (msg) => {
+    out += msg;
+    return true;
+  };
+  try {
+    fn();
+  } finally {
+    process.stdout.write = original;
+  }
+  return out;
+}
+
 const ACTION_YML = fs.readFileSync(path.join(__dirname, '..', 'action.yml'), 'utf8');
 
 /** Declared default for an input in action.yml, so a test can pin a duplicate against it. */
@@ -434,20 +450,20 @@ describe('agentLogin', () => {
     assert.doesNotThrow(() => action.agentLogin(agent, { name: 'X', value: 'y' }));
   });
 
-  test('a failing login is a broken gate, not a verdict', () => {
+  test('a failing login is a warning, not an error: the CLI then finds the agent logged out and publishes that', () => {
     const agent = { command: 'false', loginArgv: [] };
-    assert.throws(
-      () => action.agentLogin(agent, { name: 'OPENAI_API_KEY', value: 'sk-nope' }),
-      /could not accept the OPENAI_API_KEY credential[\s\S]*broken gate/
-    );
+    const out = printed(() => action.agentLogin(agent, { name: 'OPENAI_API_KEY', value: 'sk-nope' }));
+    assert.match(out, /::warning::false could not accept the OPENAI_API_KEY credential/);
   });
 
-  test('a missing agent binary names itself rather than surfacing ENOENT', () => {
+  test('a missing agent binary is a warning that names it, not an error', () => {
     const agent = { command: 'definitely-not-a-real-binary', loginArgv: ['login'] };
-    assert.throws(
-      () => action.agentLogin(agent, { name: 'OPENAI_API_KEY', value: 'sk-nope' }),
-      /definitely-not-a-real-binary not found on PATH/
-    );
+    const out = printed(() => action.agentLogin(agent, { name: 'OPENAI_API_KEY', value: 'sk-nope' }));
+    assert.match(out, /::warning::definitely-not-a-real-binary login did not run: not found on PATH/);
+  });
+
+  test('no credential means no login attempt', () => {
+    assert.strictEqual(printed(() => action.agentLogin({ command: 'false', loginArgv: ['login'] }, null)), '');
   });
 });
 
@@ -581,11 +597,16 @@ describe('resolveCredential', () => {
     });
   });
 
-  test('a missing credential throws and names the fork case', () => {
-    // A required check that passes when it could not run protects nothing, and
-    // an empty secret on a fork PR is the way this happens in practice.
-    assert.throws(() => action.resolveCredential({}, claude, {}), /no credential for the claude agent/);
-    assert.throws(() => action.resolveCredential({}, claude, {}), /Fork pull requests receive no secrets/);
+  test('a missing credential is null with a warning that names the fork case, and the CLI decides', () => {
+    // The CLI checks the agent is logged in before it spends anything, exits 2
+    // with the remedy, and publishes that. An error thrown here could not.
+    let result;
+    const out = printed(() => {
+      result = action.resolveCredential({}, claude, {});
+    });
+    assert.strictEqual(result, null);
+    assert.match(out, /::warning::no credential for the claude agent/);
+    assert.match(out, /Fork pull requests receive no secrets/);
   });
 
   test('codex resolves its own dedicated input, not the generic custom-vendor one', () => {
@@ -595,7 +616,7 @@ describe('resolveCredential', () => {
       value: 'sk-codex',
     });
     // The claude inputs must not leak into a different vendor's run.
-    assert.throws(() => action.resolveCredential({ anthropicApiKey: 'sk-ant' }, codex, {}), /no credential for the codex agent/);
+    printed(() => assert.strictEqual(action.resolveCredential({ anthropicApiKey: 'sk-ant' }, codex, {}), null));
   });
 
   test('a custom vendor uses its own variable name', () => {
@@ -609,7 +630,7 @@ describe('resolveCredential', () => {
       value: 'sk-gemini',
     });
     // The claude inputs must not leak into a different vendor's run.
-    assert.throws(() => action.resolveCredential({ anthropicApiKey: 'sk-ant' }, gemini, {}), /no credential for the gemini agent/);
+    printed(() => assert.strictEqual(action.resolveCredential({ anthropicApiKey: 'sk-ant' }, gemini, {}), null));
   });
 });
 
@@ -962,12 +983,16 @@ describe('teaInstallSource and installCli', () => {
 describe('assertCliIsCurrent', () => {
   const helpOf = (stdout) => () => ({ status: 0, stdout });
 
-  test('accepts a CLI whose help lists --github', () => {
-    assert.doesNotThrow(() => action.assertCliIsCurrent('next', helpOf('Options:\n  --github  publish to GitHub\n')));
+  test('accepts a CLI whose help lists --github and --publish-as', () => {
+    assert.doesNotThrow(() => action.assertCliIsCurrent('2.0.0', helpOf('Options:\n  --github  publish\n  --publish-as <tag>  identity\n')));
   });
 
   test('a CLI that predates --github fails with the version to change, not an unknown-option error', () => {
-    assert.throws(() => action.assertCliIsCurrent('1.27.2', helpOf('Options:\n  --base <ref>\n')), /1\.27\.2 predates the --github publisher.*tea-version/s);
+    assert.throws(() => action.assertCliIsCurrent('1.27.2', helpOf('Options:\n  --base <ref>\n')), /1\.27\.2 predates --github and --publish-as.*tea-version/s);
+  });
+
+  test('a CLI with --github but no --publish-as is refused too, because a custom vendor would share claude\'s comment', () => {
+    assert.throws(() => action.assertCliIsCurrent('1.28.0', helpOf('Options:\n  --github  publish\n')), /predates --publish-as/);
   });
 
   test('a package that ships no CLI names the cause instead of a bare ENOENT', () => {
@@ -1480,12 +1505,12 @@ describe('an existing workflow runs unchanged', { skip: process.platform === 'wi
     script('npm', `${record('')}\nprocess.exit(Number(process.env.FAKE_NPM_EXIT || 0));`);
     script(
       'codex',
-      `let stdin = ''; try { stdin = fs.readFileSync(0, 'utf8'); } catch {}\n${record('stdin')}`
+      `let stdin = ''; try { stdin = fs.readFileSync(0, 'utf8'); } catch {}\n${record('stdin')}\nprocess.exit(Number(process.env.FAKE_CODEX_EXIT || 0));`
     );
     script(
       'tea-test-review',
       `const argv = process.argv.slice(2);
-if (argv.includes('--help')) { process.stdout.write(process.env.FAKE_HELP || 'Options:\\n  --github  publish\\n'); process.exit(0); }
+if (argv.includes('--help')) { process.stdout.write(process.env.FAKE_HELP || 'Options:\\n  --github  publish\\n  --publish-as <tag>  identity\\n'); process.exit(0); }
 ${record(`env: { GITHUB_TOKEN: process.env.GITHUB_TOKEN, GITHUB_API_URL: process.env.GITHUB_API_URL, ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }, cwd: process.cwd()`)}
 if (process.env.FAKE_VERDICT) {
   const json = argv[argv.indexOf('--json') + 1];
@@ -1733,9 +1758,43 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
       assert.deepStrictEqual(argv.slice(0, 2), ['--agent', 'claude']);
       assert.strictEqual(argv[argv.indexOf('--agent-cmd') + 1], 'gemini');
       assert.strictEqual(argv[argv.indexOf('--env-pass') + 1], 'GEMINI_API_KEY');
+      assert.strictEqual(argv[argv.indexOf('--publish-as') + 1], 'gemini');
       assert.strictEqual(argv[argv.indexOf('--artifact-name') + 1], 'tea-test-review-review-gemini');
       assert.match(run.stdout, /::warning::Agent "gemini" is not a built-in vendor/);
       assert.strictEqual(run.outputs.agent, 'gemini');
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a built-in agent passes no --publish-as: its key is already the CLI default', async () => {
+    const run = await runAction();
+    try {
+      assert.ok(!cliCall(run).argv.includes('--publish-as'));
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a missing credential does not stop the run: the CLI checks the agent, exits 2 and publishes', async () => {
+    const run = await runAction({ inputs: { ...EVERY_INPUT, 'anthropic-api-key': '' }, verdict: null, exit: 2 });
+    try {
+      assert.strictEqual(run.status, 2);
+      assert.ok(cliCall(run), 'the CLI must run so it can publish the broken gate');
+      assert.match(run.stdout, /::warning::no credential for the claude agent/);
+      assert.match(run.stdout, /credential: \(none\)/);
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a codex login that fails is a warning and the CLI still runs, so its login check publishes', async () => {
+    const inputs = { ...EVERY_INPUT, agent: 'codex', 'anthropic-api-key': '', 'openai-api-key': 'sk-openai-test', model: '', 'agent-args': '' };
+    const run = await runAction({ inputs, extraEnv: { FAKE_CODEX_EXIT: '1' }, verdict: null, exit: 2 });
+    try {
+      assert.strictEqual(run.status, 2);
+      assert.ok(cliCall(run), 'the CLI must run so it can publish the broken gate');
+      assert.match(run.stdout, /::warning::codex could not accept the OPENAI_API_KEY credential \(exit 1\)/);
     } finally {
       run.cleanup();
     }
@@ -1856,7 +1915,7 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     try {
       assert.strictEqual(run.status, 2);
       assert.strictEqual(cliCall(run), undefined, 'the review must not start');
-      assert.match(run.stdout, /::error::bmad-method-test-architecture-enterprise@1\.28\.0 predates the --github publisher/);
+      assert.match(run.stdout, /::error::bmad-method-test-architecture-enterprise@1\.28\.0 predates --github and --publish-as/);
     } finally {
       run.cleanup();
     }

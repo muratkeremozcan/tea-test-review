@@ -175,7 +175,7 @@ model generation. The slug that ran is recorded in the verdict JSON next to
 
 ### Dual reviews (Codex & Claude)
 
-Run multiple review steps in the same workflow. For `claude` and `codex`, comments (`<!-- tea-test-review:<agent> -->`) and report artifacts (`tea-test-review-<job>-<agent>`) tag by the `agent` key, so each agent posts its own comment without collision:
+Run multiple review steps in the same workflow. Comments (`<!-- tea-test-review:<agent> -->`) and report artifacts (`tea-test-review-<job>-<agent>`) tag by the `agent` key, so each agent posts its own comment without collision:
 
 ```yaml
 steps:
@@ -200,10 +200,9 @@ steps:
       check-run-name: TEA Test Review (claude)
 ```
 
-That tagging is automatic. A custom vendor runs as `--agent claude`, so its
-comment marker and check text carry the `claude` tag and collide with a claude
-review on the same pull request; its artifact still tags by the `agent` input.
-The check run is matched by name, so two reviews on one pull request need two
+That tagging is automatic. A custom vendor runs as `--agent claude`, so the
+action passes its own key as `--publish-as`: its comment, check text and
+artifact carry that key and never share a claude review's. The check run is matched by name, so two reviews on one pull request need two
 different `check-run-name` values, or both post a check run under one name and
 the required check reports whichever finished last. Running the same agent twice in
 one workflow (e.g. two `codex` steps with different models) is not
@@ -298,8 +297,10 @@ never costs you the review.
 
 `2` and `3` mean no review happened; the log says so, and so do the comment
 and check run whenever the CLI got far enough to publish them (a failure in the
-action before the CLI starts, such as the install, a missing credential or the
-agent login, publishes neither). Neither is ever reported as approved tests. The CLI retries exit `3` once
+action before the CLI starts, that is the npm install or a `tea-version` too old
+for the flags the action passes, publishes neither; a missing credential or a
+failed agent login does reach the pull request, because the CLI checks the agent
+and publishes that exit 2). Neither is ever reported as approved tests. The CLI retries exit `3` once
 (the action passes `--retries 1`; a fresh agent invocation, not a report
 re-parse) before giving up: a crashed agent process is often a one-off blip
 rather than a real problem with the diff. `1` and `2` are never retried; a
@@ -496,8 +497,8 @@ vendors get the login step above.
   comment, and two built-in agents on one pull request keep one comment each. The
   comment and the check run belong to the `github-token`'s account. A comment
   or check run that cannot be written is a warning and never changes the
-  verdict. A failure before the CLI starts (npm install, a missing credential,
-  agent login, a `tea-version` without `--github`) opens no check run and posts
+  verdict. A failure before the CLI starts (the npm install, a `tea-version`
+  whose CLI lacks `--github` or `--publish-as`) opens no check run and posts
   no comment; the job's own failure is the signal, and a required check stays
   Expected until a later run reports it.
 - The CLI prints a heartbeat every 15 seconds, streamed straight through, so

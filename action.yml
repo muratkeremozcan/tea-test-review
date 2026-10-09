@@ -336,9 +336,11 @@ inputs:
       nothing at all. A later run of the same agent on the same commit adopts the
       check run it left open rather than stacking a second one under the same
       name, so a re-run clears the first case. A failure before the CLI starts
-      (the npm install, a missing credential, the agent login, a tea-version
-      without `--github`) opens no check run, and a required check stays
-      Expected until a later run reports it.
+      (the npm install, a tea-version whose CLI lacks `--github` or
+      `--publish-as`) opens no check run, and a required check stays Expected
+      until a later run reports it. A missing credential or a failed agent login
+      does not stop the action: the CLI finds the agent logged out, exits 2 with
+      the remedy, and publishes that as a broken gate.
 
       A check run that cannot be created is a warning, never a failure, on the
       same contract as the comment. The Checks API needs a GitHub App
@@ -352,8 +354,8 @@ inputs:
       name, so this stays fixed no matter which agent runs: a mention can switch
       vendors mid-pull-request, and a name carrying the vendor would stop
       reporting under the name that was required. The agent that ran is named in
-      the check's own output instead (a custom vendor runs as `--agent claude`
-      and is named so).
+      the check's own output instead (a custom vendor is named by its `agent`
+      value).
 
       Two reviews in one workflow must set two different names, or both post a
       check run under one name and the required check reports whichever finished
