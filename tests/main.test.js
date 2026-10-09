@@ -1,16 +1,19 @@
 /**
  * Tests for the tea-test-review action.
  *
- * The groups that matter most:
+ * The action is a wrapper over the `tea-test-review` CLI, so the review itself
+ * (the comment text and its upsert, the check run, the retry, the base-ref
+ * lookup, the packaged skill) is tested in the CLI's own repository. What is
+ * pinned here is the wiring:
  *
- *   - "buildCliArgs" and "action.yml defaults", because this action is a wrapper
- *     and a wrapper's whole job is to state every input the review branches on. A
- *     duplicated default that drifts from action.yml, or a TEA config key that
- *     silently stops being passed, changes what the agent reviews against without
- *     changing anything visible.
- *   - "buildCommentBody", because the inlined report is the feature: the comment
- *     exists so a reviewer can paste it into a coding agent, and the oversize
- *     fallback is the one path that silently drops it.
+ *   - "an existing workflow runs unchanged" runs main.js as a child process with
+ *     every declared input set, against stand-ins for `npm` and the CLI, and
+ *     asserts the exact argv, environment and outputs. It is the end-to-end
+ *     proof that every input still reaches the CLI.
+ *   - "buildCliArgs" and "action.yml defaults", because a wrapper's whole job is
+ *     to state every input the review branches on. A duplicated default that
+ *     drifts from action.yml changes what the agent reviews without changing
+ *     anything visible.
  *   - "verdict handling", because a skip, a pass, a waiver and a broken gate must
  *     never read alike.
  */
@@ -18,8 +21,10 @@
 const { test, describe, afterEach } = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 
 const action = require('../main.js');
 
@@ -31,6 +36,28 @@ function declaredDefault(inputName) {
   assert.ok(block, `action.yml has no input named ${inputName}`);
   const match = /^    default: '(.*)'$/m.exec(block[1]);
   return match ? match[1] : null;
+}
+
+/** Names declared under `inputs:` in action.yml. */
+function declaredInputs() {
+  const section = ACTION_YML.slice(ACTION_YML.indexOf('\ninputs:'), ACTION_YML.indexOf('\noutputs:'));
+  return [...section.matchAll(/^  ([a-z-]+):$/gm)].map((m) => m[1]);
+}
+
+/** Run fn with stdout captured, restoring the real one even when fn throws. */
+async function captureStdout(fn) {
+  const original = process.stdout.write;
+  let logged = '';
+  process.stdout.write = (msg) => {
+    logged += msg;
+    return true;
+  };
+  try {
+    await fn();
+  } finally {
+    process.stdout.write = original;
+  }
+  return logged;
 }
 
 describe('getInput', () => {
@@ -72,6 +99,7 @@ describe('binaryName', () => {
   });
 });
 
+
 describe('resolveBaseRef', () => {
   test('an explicit value wins', () => {
     assert.strictEqual(action.resolveBaseRef('origin/release', { GITHUB_BASE_REF: 'main' }), 'origin/release');
@@ -82,76 +110,11 @@ describe('resolveBaseRef', () => {
     assert.strictEqual(action.resolveBaseRef('', { GITHUB_BASE_REF: 'release/2.0' }), 'origin/release/2.0');
   });
 
-  test('falls back to origin/main off a pull request', () => {
-    assert.strictEqual(action.resolveBaseRef('', {}), 'origin/main');
-    assert.strictEqual(action.resolveBaseRef(undefined, { GITHUB_BASE_REF: '' }), 'origin/main');
-  });
-});
-
-describe('resolveRunBaseRef', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const ok = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) });
-  const err = (status) => ({ ok: false, status, json: async () => null, text: async () => 'boom' });
-  const opts = { baseRef: 'origin/main', token: 't', apiUrl: 'https://api.github.com' };
-
-  test('a base ref stated by the caller or the event never touches the API', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ok({});
-    };
-    const payload = { issue: { number: 7 } };
-    assert.strictEqual(await action.resolveRunBaseRef(opts, payload, { GITHUB_BASE_REF: 'release/2.0' }), 'origin/main');
-    assert.strictEqual(await action.resolveRunBaseRef(opts, payload, { 'INPUT_BASE-REF': 'origin/9.x' }), 'origin/main');
-    assert.strictEqual(calls, 0);
-  });
-
-  test('no pull request in context keeps the origin/main guess, so push runs are unchanged', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ok({});
-    };
-    assert.strictEqual(await action.resolveRunBaseRef(opts, null, {}), 'origin/main');
-    assert.strictEqual(calls, 0);
-  });
-
-  test('an issue_comment run resolves the PR base through the pulls API', async () => {
-    let seen;
-    global.fetch = async (url) => {
-      seen = url;
-      return ok({ base: { ref: 'release/2.0' } });
-    };
-    const resolved = await action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' });
-    assert.strictEqual(resolved, 'origin/release/2.0');
-    assert.strictEqual(seen, 'https://api.github.com/repos/o/r/pulls/7');
-  });
-
-  test('an API failure fails loudly instead of diffing against the wrong base', async () => {
-    global.fetch = async () => err(404);
-    await assert.rejects(
-      action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
-      /Pass base-ref explicitly/
-    );
-  });
-
-  test('a missing token fails loudly for the same reason', async () => {
-    await assert.rejects(
-      action.resolveRunBaseRef({ ...opts, token: '' }, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
-      /Pass base-ref explicitly/
-    );
-  });
-
-  test('a response without a base ref fails loudly', async () => {
-    global.fetch = async () => ok({});
-    await assert.rejects(
-      action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
-      /no base ref/
-    );
+  test('is empty when neither the caller nor the event states one, leaving the lookup to the CLI', () => {
+    // An issue_comment run carries no base ref. The CLI resolves it through
+    // --pr, and a push run falls to the CLI's own origin/main.
+    assert.strictEqual(action.resolveBaseRef('', {}), '');
+    assert.strictEqual(action.resolveBaseRef(undefined, { GITHUB_BASE_REF: '' }), '');
   });
 });
 
@@ -314,6 +277,7 @@ describe('resolveTrigger', () => {
   });
 });
 
+
 describe('buildOptions trigger overrides', () => {
   const baseEnv = { INPUT_AGENT: 'claude', 'INPUT_ANTHROPIC-API-KEY': 'sk-test' };
 
@@ -352,23 +316,6 @@ describe('buildOptions trigger overrides', () => {
   test('without a switch the configured model and agent-args stand', () => {
     const opts = action.buildOptions({ ...baseEnv, INPUT_MODEL: 'claude-sonnet-4-6' }, { agentOverride: 'claude', agentSwitched: false });
     assert.strictEqual(opts.cli.model, 'claude-sonnet-4-6');
-  });
-
-  test('focus travels into the CLI args as --focus', () => {
-    const opts = action.buildOptions(baseEnv, { focus: 'look at auth' });
-    assert.strictEqual(opts.cli.focus, 'look at auth');
-    const args = action.buildCliArgs({
-      ...opts.cli,
-      baseRef: 'origin/main',
-      skillRoot: '/tmp/skill',
-      reportPath: 'r.md',
-      jsonPath: 'r.json',
-      cliAgent: 'claude',
-      agentCommand: 'claude',
-      envPass: '',
-    });
-    const index = args.indexOf('--focus');
-    assert.ok(index !== -1 && args[index + 1] === 'look at auth', args.join(' '));
   });
 });
 
@@ -687,41 +634,95 @@ describe('childEnv', () => {
   });
 });
 
+describe('childEnv publishing context', () => {
+  const userInfo = { homedir: '/home/runner', username: 'runner' };
+
+  test('the token and API URL reach the CLI through the environment, never argv', () => {
+    const env = action.childEnv(null, { PATH: '/usr/bin' }, userInfo, { token: 'ghs_x', apiUrl: 'https://ghe.example/api/v3' });
+    assert.strictEqual(env.GITHUB_TOKEN, 'ghs_x');
+    assert.strictEqual(env.GITHUB_API_URL, 'https://ghe.example/api/v3');
+  });
+
+  test('an empty token leaves the runner environment alone', () => {
+    const env = action.childEnv(null, { GITHUB_TOKEN: 'from-runner' }, userInfo, { token: '' });
+    assert.strictEqual(env.GITHUB_TOKEN, 'from-runner');
+  });
+});
+
 describe('buildCliArgs', () => {
   const base = {
-    baseRef: 'origin/main',
-    skillRoot: '/tmp/skill',
     reportPath: 'test-review.md',
     jsonPath: 'test-review.json',
     cliAgent: 'claude',
     agentCommand: 'claude',
   };
 
-  test('the mandatory shape: pinned skill root, both output files, claude executor', () => {
+  test('the mandatory shape: executor, both output files, and the CLI retry', () => {
     assert.deepStrictEqual(action.buildCliArgs(base), [
-      '--base',
-      'origin/main',
       '--agent',
       'claude',
-      '--skill-root',
-      '/tmp/skill',
       '--output',
       'test-review.md',
       '--json',
       'test-review.json',
+      '--retries',
+      '1',
     ]);
   });
 
-  test('--skill-root is always passed, so the PR checkout is never probed for the reviewer', () => {
-    // Without it the CLI probes the project, and a PR that edits its own vendored
-    // _bmad/ copy would be rewriting the reviewer that judges it.
-    const args = action.buildCliArgs(base);
-    assert.ok(args.includes('--skill-root'));
-    assert.strictEqual(args[args.indexOf('--skill-root') + 1], '/tmp/skill');
+  test('the action never names a skill: the CLI reviews with the skill packaged beside it', () => {
+    // --skill-root or --project-skill here would hand the pull request a way to
+    // edit the reviewer that judges it. The packaged skill is out of its reach.
+    const args = action.buildCliArgs({ ...base, baseRef: 'origin/main', pr: 7, publish: true, checkRunName: 'x', comment: true, checkRun: true });
+    for (const flag of ['--skill-root', '--project-skill']) assert.ok(!args.includes(flag), flag);
   });
 
-  test('--json is always passed, because the verdict and the comment both come from it', () => {
-    assert.ok(action.buildCliArgs(base).includes('--json'));
+  test('the retry is the CLI\'s own, once, so the action runs the agent at most twice', () => {
+    const args = action.buildCliArgs(base);
+    assert.strictEqual(args[args.indexOf('--retries') + 1], String(action.CLI_RETRIES));
+    assert.strictEqual(action.CLI_RETRIES, 1);
+  });
+
+  test('a stated base ref becomes --base, and an absent one passes nothing', () => {
+    const stated = action.buildCliArgs({ ...base, baseRef: 'origin/release' });
+    assert.strictEqual(stated[stated.indexOf('--base') + 1], 'origin/release');
+    assert.ok(!action.buildCliArgs({ ...base, baseRef: '' }).includes('--base'));
+  });
+
+  test('--pr carries the pull request, which is both the base lookup and the publish target', () => {
+    const args = action.buildCliArgs({ ...base, pr: 7 });
+    assert.strictEqual(args[args.indexOf('--pr') + 1], '7');
+    assert.ok(!action.buildCliArgs({ ...base, pr: null }).includes('--pr'));
+  });
+
+  test('publishing turns on --github with the check name and the artifact the upload step creates', () => {
+    const args = action.buildCliArgs({
+      ...base,
+      publish: true,
+      comment: true,
+      checkRun: true,
+      checkRunName: 'TEA Test Review',
+      artifactName: 'tea-test-review-review-claude',
+    });
+    assert.ok(args.includes('--github'));
+    assert.strictEqual(args[args.indexOf('--check-name') + 1], 'TEA Test Review');
+    assert.strictEqual(args[args.indexOf('--artifact-name') + 1], 'tea-test-review-review-claude');
+    assert.ok(!args.includes('--no-pr-comment'));
+    assert.ok(!args.includes('--no-check-run'));
+  });
+
+  test('comment false and check-run false each switch off their own surface', () => {
+    const noComment = action.buildCliArgs({ ...base, publish: true, comment: false, checkRun: true, checkRunName: 'x' });
+    assert.ok(noComment.includes('--no-pr-comment') && !noComment.includes('--no-check-run'));
+    const noCheck = action.buildCliArgs({ ...base, publish: true, comment: true, checkRun: false, checkRunName: 'x' });
+    assert.ok(noCheck.includes('--no-check-run') && !noCheck.includes('--no-pr-comment'));
+  });
+
+  test('nothing GitHub-shaped is passed when not publishing, because the CLI rejects those flags without --github', () => {
+    const args = action.buildCliArgs({ ...base, publish: false, comment: false, checkRun: false, checkRunName: 'x', artifactName: 'a' });
+    for (const flag of ['--github', '--check-name', '--artifact-name', '--no-pr-comment', '--no-check-run']) {
+      assert.ok(!args.includes(flag), `${flag} should be absent`);
+    }
   });
 
   test('empty gate-policy inputs are omitted rather than sent as empty flags', () => {
@@ -801,14 +802,11 @@ describe('buildCliArgs', () => {
   });
 
   test('--agent-cmd is omitted when the resolved command already matches --agent', () => {
-    // True for both built-ins with no agent-command override: claude (base)
-    // and codex, since resolveAgent defaults command to the vendor's own name.
     assert.ok(!action.buildCliArgs(base).includes('--agent-cmd'));
     assert.ok(!action.buildCliArgs({ ...base, cliAgent: 'codex', agentCommand: 'codex' }).includes('--agent-cmd'));
   });
 
   test('--agent-cmd overrides the executable on top of whichever --agent adapter was selected', () => {
-    // A codex-version override, or any executable that differs from cliAgent.
     const overridden = action.buildCliArgs({ ...base, cliAgent: 'codex', agentCommand: 'codex-beta' });
     assert.strictEqual(overridden[overridden.indexOf('--agent-cmd') + 1], 'codex-beta');
     assert.strictEqual(overridden[overridden.indexOf('--agent') + 1], 'codex');
@@ -838,10 +836,14 @@ describe('buildCliArgs', () => {
     ]);
   });
 
-  test('an empty model passes nothing, leaving the CLI\'s per-vendor pinned default in charge', () => {
-    // Absent means "use the pinned default", never "let the vendor CLI decide":
-    // that resolution lives in the CLI's adapter table, not here.
+  test("an empty model passes nothing, leaving the CLI's per-vendor pinned default in charge", () => {
     assert.ok(!action.buildCliArgs({ ...base, model: '' }).includes('--model'));
+  });
+
+  test('focus becomes --focus', () => {
+    const args = action.buildCliArgs({ ...base, focus: 'look at auth' });
+    assert.strictEqual(args[args.indexOf('--focus') + 1], 'look at auth');
+    assert.ok(!action.buildCliArgs({ ...base, focus: '' }).includes('--focus'));
   });
 
   test("a custom vendor's credential is allowlisted with --env-pass", () => {
@@ -852,6 +854,140 @@ describe('buildCliArgs', () => {
   test('extra-args land last, so a caller can override an earlier flag', () => {
     const args = action.buildCliArgs({ ...base, minScore: '80', extraArgs: ['--min-score', '90', '--fail-on-skip'] });
     assert.deepStrictEqual(args.slice(-3), ['--min-score', '90', '--fail-on-skip']);
+  });
+
+  test('a caller who sets --retries in extra-args wins over the action\'s one retry', () => {
+    const args = action.buildCliArgs({ ...base, extraArgs: ['--retries', '0'] });
+    assert.deepStrictEqual(args.slice(-2), ['--retries', '0']);
+  });
+});
+
+describe('planGithub', () => {
+  const inputs = { comment: true, checkRun: true, baseRef: '', extraArgs: [] };
+
+  test('publishes with the pull request when comment or check-run is on', () => {
+    assert.deepStrictEqual(action.planGithub(inputs, 7), { dryRun: false, publish: true, pr: 7 });
+    assert.strictEqual(action.planGithub({ ...inputs, checkRun: false }, 7).publish, true);
+    assert.strictEqual(action.planGithub({ ...inputs, comment: false }, 7).publish, true);
+  });
+
+  test('both surfaces off publishes nothing, which the CLI would reject as an empty --github', () => {
+    assert.strictEqual(action.planGithub({ ...inputs, comment: false, checkRun: false }, 7).publish, false);
+  });
+
+  test('no pull request in context publishes nothing and passes no --pr', () => {
+    assert.deepStrictEqual(action.planGithub(inputs, null), { dryRun: false, publish: false, pr: null });
+  });
+
+  test('--agent none through extra-args is a dry run, which the CLI refuses to publish', () => {
+    for (const extraArgs of [['--agent', 'none'], ['--agent=none'], ['--fail-on-skip', '--agent', 'none']]) {
+      const plan = action.planGithub({ ...inputs, extraArgs }, 7);
+      assert.strictEqual(plan.dryRun, true, extraArgs.join(' '));
+      assert.strictEqual(plan.publish, false, extraArgs.join(' '));
+    }
+    assert.strictEqual(action.planGithub({ ...inputs, extraArgs: ['--agent', 'claude'] }, 7).dryRun, false);
+  });
+
+  test('the last --agent in extra-args decides, matching how the CLI reads repeated flags', () => {
+    assert.strictEqual(action.planGithub({ ...inputs, extraArgs: ['--agent', 'none', '--agent', 'claude'] }, 7).dryRun, false);
+  });
+
+  test('a stated base ref needs no lookup, so --pr is only passed to publish', () => {
+    const stated = { ...inputs, baseRef: 'origin/release', comment: false, checkRun: false };
+    assert.strictEqual(action.planGithub(stated, 7).pr, null);
+    assert.strictEqual(action.planGithub({ ...stated, comment: true }, 7).pr, 7);
+  });
+
+  test('an unstated base ref passes --pr even when nothing is published, because the CLI resolves the base from it', () => {
+    assert.strictEqual(action.planGithub({ ...inputs, comment: false, checkRun: false }, 7).pr, 7);
+  });
+
+  test('--files has no base to look up, and the CLI accepts --pr with --files only when publishing', () => {
+    const files = { ...inputs, comment: false, checkRun: false, extraArgs: ['--files', 'a.spec.ts'] };
+    assert.strictEqual(action.planGithub(files, 7).pr, null);
+    assert.strictEqual(action.planGithub({ ...files, comment: true }, 7).pr, 7);
+  });
+});
+
+describe('assertCliIsCurrent', () => {
+  const helpOf = (stdout) => () => ({ status: 0, stdout });
+
+  test('accepts a CLI whose help lists --github', () => {
+    assert.doesNotThrow(() => action.assertCliIsCurrent('next', helpOf('Options:\n  --github  publish to GitHub\n')));
+  });
+
+  test('a CLI that predates --github fails with the version to change, not an unknown-option error', () => {
+    assert.throws(() => action.assertCliIsCurrent('1.27.2', helpOf('Options:\n  --base <ref>\n')), /1\.27\.2 predates the --github publisher.*tea-version/s);
+  });
+
+  test('a package that ships no CLI names the cause instead of a bare ENOENT', () => {
+    const missing = () => ({ error: Object.assign(new Error('spawn tea-test-review ENOENT'), { code: 'ENOENT' }) });
+    assert.throws(() => action.assertCliIsCurrent('1.5.0', missing), /could not start after installing .*@1\.5\.0.*ships the tea-test-review CLI/s);
+  });
+});
+
+describe('runReviewCli', () => {
+  const setup = () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'tea-test-review-run-'));
+    return {
+      workspace,
+      opts: { workspace, reportPath: 'review.md', jsonPath: 'review.json', credential: { name: 'TEST_AGENT_KEY', value: 'secret' }, token: 'ghs_t', apiUrl: 'https://api.github.com' },
+    };
+  };
+
+  test('runs the CLI once, hands it the credential and token, and returns its exit code and verdict', () => {
+    const { workspace, opts } = setup();
+    let calls = 0;
+    try {
+      const result = action.runReviewCli(opts, ['--agent', 'claude'], (command, args, options) => {
+        calls += 1;
+        assert.strictEqual(command, action.binaryName('tea-test-review'));
+        assert.deepStrictEqual(args, ['--agent', 'claude']);
+        assert.strictEqual(options.cwd, workspace);
+        assert.strictEqual(options.env.TEST_AGENT_KEY, 'secret');
+        assert.strictEqual(options.env.GITHUB_TOKEN, 'ghs_t');
+        fs.writeFileSync(path.join(workspace, 'review.json'), JSON.stringify({ recommendation: 'Approve' }));
+        return 0;
+      });
+      assert.strictEqual(calls, 1);
+      assert.strictEqual(result.status, 0);
+      assert.strictEqual(result.verdict.recommendation, 'Approve');
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  for (const status of [1, 2, 3]) {
+    test(`exit ${status} is passed through and never re-run by the action`, () => {
+      const { workspace, opts } = setup();
+      let calls = 0;
+      try {
+        const result = action.runReviewCli(opts, [], () => {
+          calls += 1;
+          return status;
+        });
+        assert.strictEqual(calls, 1, 'the CLI owns the retry; the action runs it once');
+        assert.strictEqual(result.status, status);
+        assert.strictEqual(result.verdict, null);
+      } finally {
+        fs.rmSync(workspace, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test('a verdict left by an earlier invocation in the job is never read as this run\'s', () => {
+    // A dry run followed by a live review share report-path and json-path, and
+    // the CLI can exit 2 before writing either.
+    const { workspace, opts } = setup();
+    fs.writeFileSync(path.join(workspace, 'review.json'), JSON.stringify({ recommendation: 'Approve' }));
+    fs.writeFileSync(path.join(workspace, 'review.md'), 'stale');
+    try {
+      const result = action.runReviewCli(opts, [], () => 2);
+      assert.strictEqual(result.verdict, null);
+      assert.strictEqual(fs.existsSync(path.join(workspace, 'review.md')), false);
+    } finally {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
   });
 });
 
@@ -865,6 +1001,15 @@ describe('action.yml defaults', () => {
 
   test('tea-version', () => {
     assert.strictEqual(buildWith({}).teaVersion, declaredDefault('tea-version'));
+  });
+
+  test('tea-version defaults to the floating dist-tag next until the stable TeA cut, and says why', () => {
+    // `latest` stays on the previous release until the cut, and that release
+    // has no --github, --pr or --retries. A pinned number would not float, so
+    // the default is the dist-tag. Kerem flips it back to `latest` with the cut.
+    assert.strictEqual(declaredDefault('tea-version'), 'next');
+    assert.match(ACTION_YML, /`latest` stays on the previous release[\s\S]*?until the stable cut/);
+    assert.match(fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8'), /defaults to `next`/);
   });
 
   test('claude-code-version floats to latest', () => {
@@ -904,6 +1049,7 @@ describe('action.yml defaults', () => {
   test('base-ref is declared empty and derived at runtime', () => {
     assert.strictEqual(declaredDefault('base-ref'), '');
     assert.strictEqual(buildWith({ GITHUB_BASE_REF: 'main' }).baseRef, 'origin/main');
+    assert.strictEqual(buildWith({}).baseRef, '');
   });
 
   test('gate-on stays empty by default and passes through when set', () => {
@@ -931,11 +1077,6 @@ describe('action.yml defaults', () => {
     assert.strictEqual(declaredDefault('check-run-name'), 'TEA Test Review');
     assert.strictEqual(buildWith({}).checkRunName, 'TEA Test Review');
     assert.strictEqual(buildWith({ 'INPUT_CHECK-RUN-NAME': 'tests' }).checkRunName, 'tests');
-  });
-
-  test('every run gets its own pull request cache, so nothing leaks between them', () => {
-    assert.ok(buildWith({}).prCache instanceof Map);
-    assert.notStrictEqual(buildWith({}).prCache, buildWith({}).prCache);
   });
 
   test('every documented workflow grants the permissions the action writes with', () => {
@@ -973,6 +1114,9 @@ describe('action.yml defaults', () => {
       assert.match(ACTION_YML, new RegExp(`^  ${name}:$`, 'm'), `action.yml is missing input ${name}`);
     }
     assert.ok(read.size >= 34, `expected the full input surface, saw ${read.size}`);
+    // And the other direction: an input declared but never read is one that
+    // does nothing, which is how a removed feature hides in a wrapper.
+    for (const name of declaredInputs()) assert.ok(read.has(name), `main.js never reads input ${name}`);
   });
 
   test('every output main.js sets is declared in action.yml', () => {
@@ -1056,60 +1200,12 @@ describe('action.yml defaults', () => {
     // inputs.agent is the unresolved, un-switched configuration value; a
     // mention like @codex only changes opts.agent.key at runtime. The
     // artifact name has to read the resolved value from the review step's
-    // own output, the same source publishComment uses, or the two diverge
+    // own output, the same source the --artifact-name flag uses, or the two diverge
     // the moment a mention switches the agent.
     assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent \}\}/);
     const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-    assert.match(source, /tea-test-review-\$\{env\.GITHUB_JOB\}-\$\{agentKey\}/);
+    assert.match(source, /tea-test-review-\$\{env\.GITHUB_JOB\}-\$\{opts\.agent\.key\}/);
   });
-});
-
-describe('packedTarballName', () => {
-  test('reads the filename npm pack --json reports', () => {
-    const stdout = JSON.stringify([{ filename: 'bmad-method-test-architecture-enterprise-1.19.1.tgz' }]);
-    assert.strictEqual(action.packedTarballName(stdout, []), 'bmad-method-test-architecture-enterprise-1.19.1.tgz');
-  });
-
-  test('accepts a bare object as well as an array', () => {
-    assert.strictEqual(action.packedTarballName(JSON.stringify({ filename: 'pkg-1.0.0.tgz' }), []), 'pkg-1.0.0.tgz');
-  });
-
-  test('falls back to the directory when the output is not JSON', () => {
-    // The filename is only predictable when the version is an exact number, and
-    // tea-version accepts a dist-tag.
-    assert.strictEqual(action.packedTarballName('npm notice something', ['pkg-1.19.1.tgz', 'other.txt']), 'pkg-1.19.1.tgz');
-  });
-
-  test('no tarball is an error, not an empty extract', () => {
-    assert.throws(() => action.packedTarballName('not json', []), /wrote no tarball/);
-  });
-
-  test('two tarballs is an error rather than a coin flip on which version installs', () => {
-    assert.throws(() => action.packedTarballName('not json', ['a-1.0.0.tgz', 'a-2.0.0.tgz']), /cannot tell which is the pinned one/);
-  });
-});
-
-describe('assertShipsCli', () => {
-  test('accepts a version whose package.json declares the bin', () => {
-    action.assertShipsCli({ bin: { 'tea-test-review': 'cli/test-review.js' } }, 'pkg@1.20.0');
-    action.assertShipsCli({ bin: 'cli/test-review.js' }, 'pkg@1.20.0');
-  });
-
-  const rejected = [
-    ['an empty bin map, which is what the published 1.19.1 has', { bin: {} }],
-    ['no bin field at all', {}],
-    ['a bin map for some other binary', { bin: { 'other-cli': 'x.js' } }],
-    ['an unreadable package.json', null],
-  ];
-  for (const [why, packageJson] of rejected) {
-    test(`rejects ${why}`, () => {
-      // The alternative failure is "tea-test-review not found on PATH" after two
-      // installs, which reads like a runner problem rather than a version that
-      // never had the binary.
-      assert.throws(() => action.assertShipsCli(packageJson, 'pkg@1.19.1'), /does not ship the tea-test-review CLI/);
-      assert.throws(() => action.assertShipsCli(packageJson, 'pkg@1.19.1'), /Set tea-version to the first version that ships it/);
-    });
-  }
 });
 
 describe('outputsFromVerdict', () => {
@@ -1119,6 +1215,7 @@ describe('outputsFromVerdict', () => {
     violations: { critical: 0, high: 1, medium: 2, low: 3 },
     rawQualityScore: 97,
     gateOn: 'introduced',
+    reviewMode: 'pr',
     gatingQualityScore: 96,
     gatingViolations: { critical: 0, high: 0, medium: 1, low: 0 },
     reviewedFiles: ['tests/checkout.spec.ts'],
@@ -1131,6 +1228,7 @@ describe('outputsFromVerdict', () => {
       'full-quality-score': '92',
       'raw-quality-score': '97',
       'gate-on': 'introduced',
+      'review-mode': 'pr',
       critical: '0',
       high: '0',
       medium: '1',
@@ -1140,16 +1238,36 @@ describe('outputsFromVerdict', () => {
     });
   });
 
+  test('the score outputs keep their names and read qualityScore and rawQualityScore from the current verdict', () => {
+    // TeA #388 removed allFindingsRecommendation and scoped qualityScore and
+    // violations to the pull request in pr review mode. The outputs that read
+    // the surviving fields keep working; none ever read the removed one.
+    const verdict = { ...passing, gatingQualityScore: 80, qualityScore: 80, rawQualityScore: 85 };
+    const outputs = action.outputsFromVerdict(verdict);
+    assert.strictEqual(outputs['quality-score'], '80');
+    assert.strictEqual(outputs['full-quality-score'], '80');
+    assert.strictEqual(outputs['raw-quality-score'], '85');
+    assert.ok(!('all-findings-recommendation' in outputs));
+  });
+
+  test('a full-file verdict reports its whole-set score under full-quality-score', () => {
+    const outputs = action.outputsFromVerdict({ ...passing, reviewMode: 'full-file', gateOn: 'all', gatingQualityScore: 96, qualityScore: 70 });
+    assert.strictEqual(outputs['review-mode'], 'full-file');
+    assert.strictEqual(outputs['quality-score'], '96');
+    assert.strictEqual(outputs['full-quality-score'], '70');
+  });
+
   test('a skipped review reports no score and no recommendation', () => {
     // A skip and a pass both exit 0, so `skipped` is the only way a caller can
     // tell them apart. Reporting 0/100 here would read as a catastrophic review.
-    const outputs = action.outputsFromVerdict({ skipped: true, recommendation: null, qualityScore: null, files: [] });
+    const outputs = action.outputsFromVerdict({ skipped: true, recommendation: null, qualityScore: null, files: [], gateOn: 'all' });
     assert.strictEqual(outputs.skipped, 'true');
     assert.strictEqual(outputs.recommendation, '');
     assert.strictEqual(outputs['quality-score'], '');
     assert.strictEqual(outputs['full-quality-score'], '');
     assert.strictEqual(outputs['raw-quality-score'], '');
     assert.strictEqual(outputs['gate-on'], '');
+    assert.strictEqual(outputs['review-mode'], '');
     assert.strictEqual(outputs['reviewed-files'], '0');
   });
 
@@ -1157,6 +1275,13 @@ describe('outputsFromVerdict', () => {
     const outputs = action.outputsFromVerdict(null);
     assert.strictEqual(outputs.recommendation, '');
     assert.strictEqual(outputs.critical, '0');
+  });
+
+  test('a dry run payload has no verdict fields and maps to empty outputs', () => {
+    const outputs = action.outputsFromVerdict({ promptOnly: true, files: ['a.spec.ts'] });
+    assert.strictEqual(outputs.recommendation, '');
+    assert.strictEqual(outputs['quality-score'], '');
+    assert.strictEqual(outputs.skipped, 'false');
   });
 
   test('reviewed-files counts the report manifest, which is what --min-files evaluates', () => {
@@ -1169,332 +1294,17 @@ describe('outputsFromVerdict', () => {
   });
 });
 
-describe('buildCommentBody', () => {
-  const runUrl = 'https://github.com/o/r/actions/runs/1';
-  const verdict = {
-    recommendation: 'Request Changes',
-    qualityScore: 64,
-    rawQualityScore: 84,
-    scoreOverrideRule: 'Highest severity Critical caps effective score at 69.',
-    verdictRule: 'High findings require Request Changes.',
-    gateOn: 'introduced',
-    gatingQualityScore: 79,
-    gatingViolations: { critical: 0, high: 2, medium: 1, low: 0 },
-    allFindingsRecommendation: 'Block',
-    violations: { critical: 1, high: 2, medium: 3, low: 4 },
-    reviewedFiles: ['tests/checkout.spec.ts', 'tests/cart.spec.ts'],
-    findings: [
-      { row: 'H1', title: 'first' },
-      { row: 'H2', title: 'second' },
-      { row: 'H3', title: 'third' },
-      { row: 'H4', title: 'fourth' },
-    ],
-    keyWeaknesses: ['[H1] free-form first', '[H2] free-form second', '[H3] free-form third', '[H4] free-form fourth'],
-    advisoryObservations: ['n/a', 'Consider an optional helper'],
-  };
-
-  test('carries the marker, so the next push updates this comment instead of adding one', () => {
-    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.ok(body.startsWith('<!-- tea-test-review:claude -->'));
-  });
-
-  test('the digest states score, recommendation, violations and reviewed-file count', () => {
-    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.match(body, /## TEA Test Review \(claude\): Request Changes/);
-    assert.match(body, /\*\*Gate mode\*\*: introduced/);
-    assert.match(body, /\*\*Gating quality score\*\*: 79\/100/);
-    assert.match(body, /\*\*Full-review effective score\*\*: 64\/100/);
-    assert.match(body, /\*\*Raw deduction score\*\*: 84\/100/);
-    assert.match(body, /\*\*Full-review recommendation\*\*: Block/);
-    assert.match(body, /\*\*Gating violations\*\*: 0 Critical \/ 2 High \/ 1 Medium \/ 0 Low/);
-    assert.match(body, /\*\*Reviewed files\*\*: 2/);
-  });
-
-  test('omits the full-review recommendation when the gate never overrode it', () => {
-    const { allFindingsRecommendation, ...verdictWithoutDelta } = verdict;
-    const body = action.buildCommentBody({ verdict: verdictWithoutDelta, reportText: '# report', runUrl });
-    assert.ok(!body.includes('Full-review recommendation'));
-  });
-
-  test('the digest names every reviewed file, so a finding citing a line number is attributable', () => {
-    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.match(body, /- \*\*Reviewed files\*\*: 2\n  - `tests\/checkout\.spec\.ts`\n  - `tests\/cart\.spec\.ts`/);
-  });
-
-  test('past the cap the file list collapses to an overflow line, so the digest stays a digest', () => {
-    const many = { ...verdict, reviewedFiles: Array.from({ length: 12 }, (_, i) => `tests/f${i}.spec.ts`) };
-    const body = action.buildCommentBody({ verdict: many, reportText: '# report', runUrl });
-    assert.match(body, /\*\*Reviewed files\*\*: 12/);
-    assert.match(body, /`tests\/f9\.spec\.ts`/);
-    assert.ok(!body.includes('`tests/f10.spec.ts`'));
-    assert.match(body, /… and 2 more/);
-  });
-
-  test('a malformed reviewedFiles renders as a count of zero rather than undefined', () => {
-    const body = action.buildCommentBody({ verdict: { ...verdict, reviewedFiles: 'oops' }, reportText: '# report', runUrl });
-    assert.match(body, /\*\*Reviewed files\*\*: 0/);
-    assert.ok(!body.includes('undefined'));
-  });
-
-  test('at most three key weaknesses, so the digest stays a digest', () => {
-    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.match(body, /- \[H1\] first/);
-    assert.match(body, /- \[H3\] third/);
-    assert.ok(!body.includes('- [H4] fourth'));
-    assert.ok(!body.includes('free-form'));
-  });
-
-  test('advisories are separate and empty or n/a items are hidden', () => {
-    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.match(body, /\*\*Advisory observations\*\*:\n- Consider an optional helper/);
-    assert.ok(!body.includes('- n/a'));
-  });
-
-  test('the full report is inlined in a collapsed block, which is the reason to comment at all', () => {
-    // The point is a reviewer pasting the report into their own coding agent
-    // without downloading an artifact.
-    const body = action.buildCommentBody({ verdict, reportText: '# Test Review\n\nbody text', runUrl });
-    assert.match(body, /<details>/);
-    assert.match(body, /<summary>Full report \(paste into your AI coding agent to apply the fixes\)<\/summary>/);
-    assert.match(body, /# Test Review/);
-    assert.match(body, /<\/details>/);
-  });
-
-  test('the digest names the agent and model, so two scores are comparable', () => {
-    const body = action.buildCommentBody({
-      verdict: { ...verdict, agent: 'codex', model: 'gpt-5.6-luna' },
-      reportText: '# report',
-      runUrl,
+describe('parseRepository', () => {
+  test('splits owner and repo', () => {
+    assert.deepStrictEqual(action.parseRepository({ GITHUB_REPOSITORY: 'muratkeremozcan/tea-test-review' }), {
+      owner: 'muratkeremozcan',
+      repo: 'tea-test-review',
     });
-    assert.match(body, /- \*\*Reviewer\*\*: codex \/ gpt-5\.6-luna/);
   });
 
-  test('a verdict with no agent or model omits the reviewer line rather than printing undefined', () => {
-    const body = action.buildCommentBody({ verdict, reportText: '# report', runUrl });
-    assert.ok(!body.includes('**Reviewer**'));
-  });
-
-  test('the inlined report has its frontmatter fenced, so bookkeeping stops rendering as a heading', () => {
-    // The closing `---` is a setext underline, so an unfenced block renders the
-    // resume state larger than the report title directly beneath it.
-    const reportText = "---\nlastStep: 'step-04-generate-report'\nworkflowType: 'testarch-test-review'\n---\n\n# Test Quality Review\n";
-    const body = action.buildCommentBody({ verdict, reportText, runUrl });
-    assert.match(body, /```yaml\nlastStep: 'step-04-generate-report'\nworkflowType: 'testarch-test-review'\n```/);
-    assert.match(body, /# Test Quality Review/);
-  });
-
-  test('a report containing a literal closing details tag cannot end the inline block early', () => {
-    // The zero-width space breaks it as an HTML tag while leaving the visible
-    // text unchanged; without it the rest of the report spills into the comment
-    // as raw markdown.
-    const body = action.buildCommentBody({ verdict, reportText: '# report\n\n</details>\n\nafter', runUrl });
-    assert.strictEqual(body.split('</details>').length - 1, 1);
-    assert.ok(body.includes('<\u200B/details>'));
-  });
-
-  test('an oversize report points at the uploaded artifact, which survives the runner', () => {
-    const reportText = 'x'.repeat(action.MAX_INLINE_REPORT_CHARS + 1);
-    const body = action.buildCommentBody({
-      verdict,
-      reportText,
-      runUrl,
-      reportPath: 'test-review.md',
-      artifactName: 'tea-test-review-review',
-    });
-    assert.ok(!body.includes('<details>'));
-    assert.match(body, /too large to inline \(40001 characters, limit 40000\)/);
-    assert.match(body, /uploaded as the `tea-test-review-review` artifact on the workflow run/);
-    // GitHub rejects a body over 65536, which would lose the verdict entirely.
-    assert.ok(body.length < 65536);
-  });
-
-  test('an oversize report with no artifact upload says the workspace copy dies with the job', () => {
-    const reportText = 'x'.repeat(action.MAX_INLINE_REPORT_CHARS + 1);
-    const body = action.buildCommentBody({ verdict, reportText, runUrl, reportPath: 'test-review.md' });
-    assert.match(body, /`test-review\.md`, which the runner deletes when the job ends/);
-    assert.match(body, /enable `upload-report` or add an `actions\/upload-artifact` step/);
-  });
-
-  test('a report exactly at the cap is still inlined', () => {
-    const body = action.buildCommentBody({
-      verdict,
-      reportText: 'x'.repeat(action.MAX_INLINE_REPORT_CHARS),
-      runUrl,
-    });
-    assert.match(body, /<details>/);
-  });
-
-  test('a missing report keeps the digest instead of dropping the comment', () => {
-    const body = action.buildCommentBody({ verdict, reportText: null, runUrl, reportPath: 'test-review.md' });
-    assert.match(body, /\*\*Gating quality score\*\*: 79\/100/);
-    assert.match(body, /not readable from the workspace/);
-  });
-
-  test('a skipped review says so, and claims no verdict', () => {
-    const body = action.buildCommentBody({
-      verdict: { skipped: true, reason: 'no changed test files in diff' },
-      runUrl,
-    });
-    assert.match(body, /## TEA Test Review \(claude\): skipped/);
-    assert.match(body, /no changed test files in diff\./);
-    assert.ok(!body.includes('Quality score'));
-  });
-
-  test('a skip with no reason still reads as a skip', () => {
-    const body = action.buildCommentBody({ verdict: { skipped: true }, runUrl });
-    assert.match(body, /No changed test files in this PR\./);
-  });
-
-  test('a skip says what the PR changed instead, when the context set is known', () => {
-    const body = action.buildCommentBody({
-      verdict: { skipped: true, reason: 'no changed test files in diff', contextFiles: ['src/a.ts', 'src/b.ts'] },
-      runUrl,
-    });
-    assert.match(body, /no changed test files in diff \(2 other files changed\)\./);
-    assert.ok(!body.includes('You asked me to focus on'));
-  });
-
-  test('a mention-triggered skip acknowledges the focus, so the requester knows they were heard', () => {
-    const body = action.buildCommentBody({
-      verdict: { skipped: true, reason: 'no changed test files in diff', contextFiles: ['src/auth/login.ts'] },
-      focus: 'what about the retry handling',
-      runUrl,
-    });
-    assert.match(body, /\(1 other file changed\)/);
-    assert.match(body, /You asked me to focus on:\n\n> what about the retry handling\n/);
-    assert.match(body, /There were no tests in scope to apply that to\./);
-  });
-
-  test('a multi-line focus quotes every line', () => {
-    const body = action.buildCommentBody({
-      verdict: { skipped: true },
-      focus: 'look at auth\nand the retries',
-      runUrl,
-    });
-    assert.match(body, /> look at auth\n> and the retries\n/);
-  });
-
-  test('an --agent none dry run says no review happened, rather than a verdict of undefined', () => {
-    // Reachable through extra-args, and the payload has no recommendation at all.
-    const body = action.buildCommentBody({ verdict: { promptOnly: true, files: ['tests/a.spec.ts'] }, runUrl });
-    assert.match(body, /## TEA Test Review \(claude\): no review performed/);
-    assert.match(body, /Files that would have been reviewed: 1\./);
-    assert.ok(!body.includes('undefined'));
-  });
-
-  test('a dry run lists the files, because the file set is its whole output', () => {
-    const body = action.buildCommentBody({
-      verdict: { promptOnly: true, files: ['tests/a.spec.ts', 'tests/b.spec.ts'] },
-      runUrl,
-    });
-    assert.match(body, /Files that would have been reviewed: 2\.\n- `tests\/a\.spec\.ts`\n- `tests\/b\.spec\.ts`/);
-  });
-
-  test('no verdict at all reads as a broken gate, never as approved tests', () => {
-    // The distinction the whole action turns on: exit 2 and 3 are not verdicts.
-    const body = action.buildCommentBody({ verdict: null, runUrl, reviewResult: 'exit 3 (agent failure)' });
-    assert.match(body, /## TEA Test Review \(claude\): infrastructure failure/);
-    assert.match(body, /\*\*not\*\* a review verdict/);
-    assert.match(body, /treat the gate as broken, not as approved tests/);
-    assert.match(body, /exit 3 \(agent failure\)/);
-  });
-
-  test('a waiver is stated in the comment rather than hidden behind a green step', () => {
-    const body = action.buildCommentBody({
-      verdict: { ...verdict, waived: true, waiveReason: 'flaky suite, FP-1234', waiveUntil: '2026-09-30' },
-      reportText: '# report',
-      runUrl,
-    });
-    assert.match(body, /\*\*Waived\*\*: flaky suite, FP-1234 \(until 2026-09-30\)/);
-  });
-
-  test('machine-readable gate failures are surfaced', () => {
-    const body = action.buildCommentBody({
-      verdict: { ...verdict, gateFailures: ['insufficient evidence: 1 files reviewed (3 required)'] },
-      reportText: '# report',
-      runUrl,
-    });
-    assert.match(body, /\*\*Gate failures\*\*: insufficient evidence: 1 files reviewed \(3 required\)/);
-  });
-
-  test('missing violation counts render as zeros rather than undefined', () => {
-    const body = action.buildCommentBody({
-      verdict: { recommendation: 'Approve', qualityScore: 100 },
-      reportText: '# report',
-      runUrl,
-    });
-    assert.match(body, /\*\*Gating violations\*\*: 0 Critical \/ 0 High \/ 0 Medium \/ 0 Low/);
-    assert.ok(!body.includes('undefined'));
-  });
-
-  test('formats header and marker with agent key', () => {
-    const body = action.buildCommentBody({
-      verdict: { recommendation: 'Approve', qualityScore: 90 },
-      reportText: '# report',
-      runUrl,
-      agent: 'codex',
-    });
-    assert.match(body, /^<!-- tea-test-review:codex -->/);
-    assert.match(body, /^## TEA Test Review \(codex\): Approve/m);
-  });
-});
-
-describe('buildCommentMarker', () => {
-  test('returns agent-tagged marker', () => {
-    assert.strictEqual(action.buildCommentMarker('codex'), '<!-- tea-test-review:codex -->');
-    assert.strictEqual(action.buildCommentMarker('claude'), '<!-- tea-test-review:claude -->');
-    assert.strictEqual(action.buildCommentMarker(), '<!-- tea-test-review:claude -->');
-  });
-});
-
-describe('findOwnComment', () => {
-  test('finds the comment carrying the agent-tagged marker', () => {
-    const found = action.findOwnComment([
-      { id: 1, body: 'unrelated review note' },
-      { id: 2, body: `<!-- tea-test-review:claude -->\n## TEA Test Review (claude): Approve` },
-    ]);
-    assert.strictEqual(found.id, 2);
-  });
-
-  test('finds a tagged comment matching the agent', () => {
-    const found = action.findOwnComment(
-      [
-        { id: 1, body: '<!-- tea-test-review:claude -->\n## TEA Test Review (claude): Approve' },
-        { id: 2, body: '<!-- tea-test-review:codex -->\n## TEA Test Review (codex): Approve' },
-      ],
-      'codex'
-    );
-    assert.strictEqual(found.id, 2);
-  });
-
-  test('only the default agent adopts an untagged legacy comment on upgrade', () => {
-    const legacy = [{ id: 1, body: '<!-- tea-test-review -->\n## TEA Test Review: Approve' }];
-    assert.strictEqual(action.findOwnComment(legacy, 'claude').id, 1);
-  });
-
-  test('a non-default agent never claims a legacy comment, so two agents racing on the same PR cannot clobber each other', () => {
-    const legacy = [{ id: 1, body: '<!-- tea-test-review -->\n## TEA Test Review: Approve' }];
-    assert.strictEqual(action.findOwnComment(legacy, 'codex'), null);
-  });
-
-  test('an exact agent-tagged match wins even when an unrelated legacy comment sorts earlier in the list', () => {
-    const found = action.findOwnComment(
-      [
-        { id: 1, body: '<!-- tea-test-review -->\n## TEA Test Review: Approve' },
-        { id: 2, body: '<!-- tea-test-review:codex -->\n## TEA Test Review (codex): Approve' },
-      ],
-      'codex'
-    );
-    assert.strictEqual(found.id, 2);
-  });
-
-  test('ignores a human comment that happens to mention the action', () => {
-    assert.strictEqual(action.findOwnComment([{ id: 1, body: 'tea-test-review said 64/100' }]), null);
-  });
-
-  test('tolerates an empty list and a body-less comment', () => {
-    assert.strictEqual(action.findOwnComment([]), null);
-    assert.strictEqual(action.findOwnComment([{ id: 1 }, null]), null);
+  test('null when it is absent or malformed', () => {
+    assert.strictEqual(action.parseRepository({}), null);
+    assert.strictEqual(action.parseRepository({ GITHUB_REPOSITORY: 'no-slash' }), null);
   });
 });
 
@@ -1514,218 +1324,6 @@ describe('resolvePrNumber', () => {
   test('null off a pull request, so the comment step is skipped rather than guessed', () => {
     assert.strictEqual(action.resolvePrNumber(null, { GITHUB_REF: 'refs/heads/main' }), null);
     assert.strictEqual(action.resolvePrNumber({}, {}), null);
-  });
-});
-
-describe('parseRepository and workflowRunUrl', () => {
-  test('splits owner and repo', () => {
-    assert.deepStrictEqual(action.parseRepository({ GITHUB_REPOSITORY: 'muratkeremozcan/tea-test-review' }), {
-      owner: 'muratkeremozcan',
-      repo: 'tea-test-review',
-    });
-  });
-
-  test('null when it is absent or malformed', () => {
-    assert.strictEqual(action.parseRepository({}), null);
-    assert.strictEqual(action.parseRepository({ GITHUB_REPOSITORY: 'no-slash' }), null);
-  });
-
-  test('the run URL honours GITHUB_SERVER_URL, so GHES links resolve', () => {
-    assert.strictEqual(
-      action.workflowRunUrl({
-        GITHUB_SERVER_URL: 'https://ghe.example.com/',
-        GITHUB_REPOSITORY: 'o/r',
-        GITHUB_RUN_ID: '99',
-      }),
-      'https://ghe.example.com/o/r/actions/runs/99'
-    );
-  });
-});
-
-describe('isRetryableStatus', () => {
-  for (const status of [429, 500, 502, 503]) {
-    test(`${status} is retried`, () => assert.strictEqual(action.isRetryableStatus(status), true));
-  }
-  for (const status of [401, 403, 404, 422]) {
-    test(`${status} is not retried, because it will not fix itself`, () => {
-      assert.strictEqual(action.isRetryableStatus(status), false);
-    });
-  }
-});
-
-describe('runReviewCli', () => {
-  for (const scenario of [
-    { name: 'retries an agent failure that then passes', statuses: [3, 0], expectedStatus: 0 },
-    { name: 'stops after one retry when the agent fails again', statuses: [3, 3], expectedStatus: 3 },
-    { name: 'does not retry a verdict failure', statuses: [1], expectedStatus: 1 },
-    { name: 'does not retry a configuration failure', statuses: [2], expectedStatus: 2 },
-  ]) {
-    test(scenario.name, () => {
-      const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'tea-test-review-retry-'));
-      const opts = {
-        workspace,
-        reportPath: 'review.md',
-        jsonPath: 'review.json',
-        credential: { name: 'TEST_AGENT_KEY', value: 'secret' },
-      };
-      const reportFile = path.join(workspace, opts.reportPath);
-      const jsonFile = path.join(workspace, opts.jsonPath);
-      let calls = 0;
-
-      try {
-        const result = action.runReviewCli(opts, ['--base', 'origin/main'], (command, args, options) => {
-          calls += 1;
-          assert.strictEqual(command, action.binaryName('tea-test-review'));
-          assert.deepStrictEqual(args, ['--base', 'origin/main']);
-          assert.strictEqual(options.cwd, workspace);
-          assert.strictEqual(options.env.TEST_AGENT_KEY, 'secret');
-          if (calls > 1) {
-            assert.strictEqual(fs.existsSync(reportFile), false, 'retry starts without the prior report');
-            assert.strictEqual(fs.existsSync(jsonFile), false, 'retry starts without the prior verdict');
-          }
-          fs.writeFileSync(reportFile, `attempt ${calls}\n`);
-          fs.writeFileSync(jsonFile, JSON.stringify({ recommendation: `attempt ${calls}` }));
-          return scenario.statuses[calls - 1];
-        });
-
-        assert.strictEqual(calls, scenario.statuses.length);
-        assert.strictEqual(result.status, scenario.expectedStatus);
-        assert.strictEqual(result.verdict.recommendation, `attempt ${calls}`);
-        assert.strictEqual(fs.readFileSync(reportFile, 'utf8'), `attempt ${calls}\n`);
-      } finally {
-        fs.rmSync(workspace, { recursive: true, force: true });
-      }
-    });
-  }
-});
-
-describe('githubRequest', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const ok = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) });
-  const err = (status) => ({ ok: false, status, json: async () => null, text: async () => 'boom' });
-
-  test('sends the token, the pinned user agent, and a JSON body', async () => {
-    const calls = [];
-    global.fetch = async (url, init) => {
-      calls.push({ url, init });
-      return ok({ id: 1 });
-    };
-    await action.githubRequest({
-      apiUrl: 'https://api.github.com',
-      token: 'sk-token',
-      method: 'POST',
-      path: '/repos/o/r/issues/1/comments',
-      body: { body: 'hello' },
-    });
-    assert.strictEqual(calls[0].url, 'https://api.github.com/repos/o/r/issues/1/comments');
-    assert.strictEqual(calls[0].init.headers.authorization, 'bearer sk-token');
-    assert.strictEqual(calls[0].init.headers['user-agent'], 'muratkeremozcan/tea-test-review');
-    assert.strictEqual(calls[0].init.body, '{"body":"hello"}');
-  });
-
-  test('a trailing slash on the API URL does not double up', async () => {
-    let seen;
-    global.fetch = async (url) => {
-      seen = url;
-      return ok({});
-    };
-    await action.githubRequest({ apiUrl: 'https://api.github.com/', token: 't', method: 'GET', path: '/x' });
-    assert.strictEqual(seen, 'https://api.github.com/x');
-  });
-
-  test('retries a 500 and then succeeds', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return calls === 1 ? err(500) : ok({ id: 2 });
-    };
-    const result = await action.githubRequest({ token: 't', method: 'GET', path: '/x' });
-    assert.strictEqual(result.id, 2);
-    assert.strictEqual(calls, 2);
-  });
-
-  test('does not retry a 403, which is a missing permission and not a blip', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return err(403);
-    };
-    await assert.rejects(action.githubRequest({ token: 't', method: 'GET', path: '/x' }), /returned 403/);
-    assert.strictEqual(calls, 1);
-  });
-
-  test('retries a network error', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      if (calls === 1) throw new Error('ECONNRESET');
-      return ok({ id: 3 });
-    };
-    const result = await action.githubRequest({ token: 't', method: 'GET', path: '/x' });
-    assert.strictEqual(result.id, 3);
-  });
-});
-
-describe('upsertComment', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
-
-  /** Stub the two-call shape: list the comments, then write one. */
-  function stub(pages) {
-    const calls = [];
-    global.fetch = async (url, init) => {
-      calls.push({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null });
-      if (init.method === 'GET') {
-        // Anchored on the separator: an unanchored /page=/ also matches per_page.
-        const page = Number(/[?&]page=(\d+)/.exec(url)[1]);
-        return { ok: true, status: 200, json: async () => pages[page - 1] || [], text: async () => '' };
-      }
-      return { ok: true, status: 200, json: async () => ({ id: 1 }), text: async () => '' };
-    };
-    return calls;
-  }
-
-  test('creates a comment when this action owns none', async () => {
-    const calls = stub([[{ id: 5, body: 'someone else' }]]);
-    const note = await action.upsertComment(ctx, 42, 'body text');
-    assert.strictEqual(note, 'Created');
-    const write = calls.find((call) => call.method === 'POST');
-    assert.strictEqual(write.url, 'https://api.github.com/repos/o/r/issues/42/comments');
-    assert.strictEqual(write.body.body, 'body text');
-  });
-
-  test('updates the one it owns rather than appending on every push', async () => {
-    const calls = stub([[{ id: 5, body: 'someone else' }, { id: 9, body: `${action.COMMENT_MARKER} old` }]]);
-    const note = await action.upsertComment(ctx, 42, 'new body');
-    assert.strictEqual(note, 'Updated');
-    const write = calls.find((call) => call.method === 'PATCH');
-    assert.strictEqual(write.url, 'https://api.github.com/repos/o/r/issues/comments/9');
-    assert.strictEqual(write.body.body, 'new body');
-    assert.ok(!calls.some((call) => call.method === 'POST'));
-  });
-
-  test('pages through a busy pull request to find its own comment', async () => {
-    // A full first page means there may be more; stopping there would post a
-    // second comment on any PR with over 100 comments.
-    const firstPage = Array.from({ length: 100 }, (_, i) => ({ id: i + 1, body: 'chatter' }));
-    const calls = stub([firstPage, [{ id: 200, body: `${action.COMMENT_MARKER} old` }]]);
-    const note = await action.upsertComment(ctx, 42, 'new body');
-    assert.strictEqual(note, 'Updated');
-    assert.strictEqual(calls.filter((call) => call.method === 'GET').length, 2);
-  });
-
-  test('stops listing on a short page', async () => {
-    const calls = stub([[{ id: 1, body: 'one' }]]);
-    await action.upsertComment(ctx, 42, 'body');
-    assert.strictEqual(calls.filter((call) => call.method === 'GET').length, 1);
   });
 });
 
@@ -1766,686 +1364,429 @@ describe('addReaction', () => {
     assert.match(logged, /::warning::Could not react to the triggering comment/);
   });
 });
-// ─── check run ────────────────────────────────────────────────────────────────
-//
-// Shared shims for the check-run suites. The response literal was inlined a
-// dozen times before, with the status and the text body drifting between
-// copies; the file's own habit is a named helper (declaredDefault, buildWith).
 
-const ghOk = (body, status = 200) => ({ ok: true, status, json: async () => body, text: async () => JSON.stringify(body) });
-const ghErr = (status, text = 'boom') => ({ ok: false, status, json: async () => null, text: async () => text });
-const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
-const RUN_URL = 'https://github.com/o/r/actions/runs/9';
+describe('an existing workflow runs unchanged', { skip: process.platform === 'win32' && 'POSIX stand-in executables' }, () => {
+  const MAIN = path.join(__dirname, '..', 'main.js');
 
-/** Run fn with stdout captured, restoring the real one even when fn throws. */
-async function captureStdout(fn) {
-  const original = process.stdout.write;
-  let logged = '';
-  process.stdout.write = (msg) => {
-    logged += msg;
-    return true;
+  /** A representative value for every input action.yml declares. A new input must be added here. */
+  const EVERY_INPUT = {
+    mode: 'auto',
+    prompt: '@claude @codex',
+    agent: 'claude',
+    'anthropic-api-key': 'sk-ant-test',
+    'claude-code-oauth-token': '',
+    'openai-api-key': '',
+    'agent-api-key': '',
+    'agent-key-env': '',
+    'agent-package': '',
+    'agent-command': '',
+    model: 'opus',
+    'agent-args': '--verbose',
+    'tea-version': '1.28.0',
+    'claude-code-version': '2.1.220',
+    'codex-version': 'latest',
+    'base-ref': 'origin/release',
+    'test-dir': 'tests',
+    scope: 'suite',
+    'min-score': '80',
+    'max-critical': '0',
+    'min-files': '1',
+    'fail-on': 'block',
+    'gate-on': 'introduced',
+    'use-playwright-utils': 'true',
+    'use-pactjs-utils': 'false',
+    'pact-mcp': 'none',
+    'extra-args': '--waive "flaky suite" --waive-until 2099-01-01',
+    'report-path': 'out/review.md',
+    'json-path': 'out/review.json',
+    'upload-report': 'true',
+    comment: 'true',
+    'check-run': 'true',
+    'check-run-name': 'Tests',
+    'github-token': 'ghs_test_token',
+    'github-api-url': 'https://ghe.example/api/v3',
   };
-  try {
-    await fn();
-  } finally {
-    process.stdout.write = original;
-  }
-  return logged;
+
+  const VERDICT = {
+    recommendation: 'Approve with Comments',
+    qualityScore: 88,
+    rawQualityScore: 91,
+    gatingQualityScore: 88,
+    gateOn: 'introduced',
+    reviewMode: 'pr',
+    gatingViolations: { critical: 0, high: 0, medium: 2, low: 1 },
+    reviewedFiles: ['tests/a.spec.ts', 'tests/b.spec.ts'],
+  };
+
+  const pullRequestEvent = { pull_request: { number: 7, head: { sha: 'a'.repeat(40) } } };
+
+  /** Stand-ins for `npm`, `codex` and `tea-test-review` that record what they were given. */
+  function makeFakeBin(dir) {
+    const script = (name, body) => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, `#!${process.execPath}\nconst fs = require('fs'), path = require('path');\n${body}\n`);
+      fs.chmodSync(file, 0o755);
+    };
+    const record = (fields) => `fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ bin: path.basename(process.argv[1]), argv: process.argv.slice(2), ${fields} }) + '\\n');`;
+    script('npm', record(''));
+    script(
+      'codex',
+      `let stdin = ''; try { stdin = fs.readFileSync(0, 'utf8'); } catch {}\n${record('stdin')}`
+    );
+    script(
+      'tea-test-review',
+      `const argv = process.argv.slice(2);
+if (argv.includes('--help')) { process.stdout.write(process.env.FAKE_HELP || 'Options:\\n  --github  publish\\n'); process.exit(0); }
+${record(`env: { GITHUB_TOKEN: process.env.GITHUB_TOKEN, GITHUB_API_URL: process.env.GITHUB_API_URL, ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY }, cwd: process.cwd()`)}
+if (process.env.FAKE_VERDICT) {
+  const json = argv[argv.indexOf('--json') + 1];
+  fs.mkdirSync(path.dirname(json), { recursive: true });
+  fs.writeFileSync(json, process.env.FAKE_VERDICT);
 }
-
-describe('fetchPullRequest', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const repo = { owner: 'o', repo: 'r' };
-  const makeOpts = () => ({ token: 't', apiUrl: 'https://api.github.com', prCache: new Map() });
-
-  test('fetches once and serves every later caller from the cache', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ghOk({ number: 7, calls });
-    };
-    const opts = makeOpts();
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { number: 7, calls: 1 });
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { number: 7, calls: 1 });
-    assert.strictEqual(calls, 1);
-  });
-
-  test('a different pull request is a different cache entry', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ghOk({ n: calls });
-    };
-    const opts = makeOpts();
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { n: 1 });
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 8), { n: 2 });
-    assert.strictEqual(calls, 2);
-  });
-
-  test('the same number in a different repository is a different entry', async () => {
-    // The key carries owner and repo because one action run can be pointed at
-    // another repository through github-api-url and a passed token.
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ghOk({ n: calls });
-    };
-    const opts = makeOpts();
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, { owner: 'o', repo: 'a' }, 7), { n: 1 });
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, { owner: 'o', repo: 'b' }, 7), { n: 2 });
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, { owner: 'p', repo: 'a' }, 7), { n: 3 });
-  });
-
-  test('an unparseable 200 is not cached, so the next caller gets its own request', async () => {
-    // githubRequest yields null for a body it cannot parse. Caching that turned
-    // the base-ref lookup, which used to recover on its own request, into a
-    // guaranteed broken gate.
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return calls === 1
-        ? {
-            ok: true,
-            status: 200,
-            json: async () => {
-              throw new Error('truncated');
-            },
-            text: async () => '',
-          }
-        : ghOk({ number: 7 });
-    };
-    const opts = makeOpts();
-    assert.strictEqual(await action.fetchPullRequest(opts, repo, 7), null);
-    assert.strictEqual(opts.prCache.size, 0);
-    assert.deepStrictEqual(await action.fetchPullRequest(opts, repo, 7), { number: 7 });
-    assert.strictEqual(calls, 2);
-  });
-
-  test('a thrown request caches nothing, so a transient failure is retried', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ghErr(404, 'gone');
-    };
-    const opts = makeOpts();
-    await assert.rejects(action.fetchPullRequest(opts, repo, 7));
-    assert.strictEqual(opts.prCache.size, 0);
-  });
-
-  test('no cache still works, so an existing caller that passes none is unchanged', async () => {
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ghOk({ number: 7 });
-    };
-    const opts = { token: 't', apiUrl: 'https://api.github.com' };
-    await action.fetchPullRequest(opts, repo, 7);
-    await action.fetchPullRequest(opts, repo, 7);
-    assert.strictEqual(calls, 2);
-  });
-
-  test('the head-SHA lookup and the base-ref lookup share one API call', async () => {
-    // This is the cache's whole reason for existing: resolveRunBaseRef already
-    // made this request, and the check run needed the head SHA off the same body.
-    let calls = 0;
-    global.fetch = async () => {
-      calls += 1;
-      return ghOk({ head: { sha: 'abc123' }, base: { ref: 'release/2.0' } });
-    };
-    const opts = { baseRef: 'origin/main', token: 't', apiUrl: 'https://api.github.com', prCache: new Map() };
-    assert.strictEqual(await action.resolveHeadSha(opts, repo, 7, null), 'abc123');
-    assert.strictEqual(
-      await action.resolveRunBaseRef(opts, { issue: { number: 7 } }, { GITHUB_REPOSITORY: 'o/r' }),
-      'origin/release/2.0'
+process.exit(Number(process.env.FAKE_EXIT || 0));`
     );
-    assert.strictEqual(calls, 1);
-  });
-});
-
-describe('resolveHeadSha', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const repo = { owner: 'o', repo: 'r' };
-  const makeOpts = () => ({ token: 't', apiUrl: 'https://api.github.com', prCache: new Map() });
-
-  test('prefers the head SHA already in a pull_request payload, with no API call', async () => {
-    global.fetch = async () => {
-      throw new Error('the payload already had it');
-    };
-    const payload = { pull_request: { head: { sha: 'abc123' } } };
-    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, payload), 'abc123');
-  });
-
-  test('falls back to the pulls API when the payload carries no commit', async () => {
-    let seen;
-    global.fetch = async (url) => {
-      seen = url;
-      return ghOk({ head: { sha: 'deadbee' } });
-    };
-    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, { issue: { number: 7 } }), 'deadbee');
-    assert.strictEqual(seen, 'https://api.github.com/repos/o/r/pulls/7');
-  });
-
-  test('a pull request with no head SHA is null, never a partial string', async () => {
-    global.fetch = async () => ghOk({ head: {} });
-    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, null), null);
-  });
-
-  test('a non-string head SHA is null, so no check run is aimed at a number', async () => {
-    global.fetch = async () => ghOk({ head: { sha: 123 } });
-    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, null), null);
-  });
-
-  test('an empty head SHA in the payload falls through to the API, not into a blank check run', async () => {
-    global.fetch = async () => ghOk({ head: { sha: 'fromapi' } });
-    const payload = { pull_request: { head: { sha: '' } } };
-    assert.strictEqual(await action.resolveHeadSha(makeOpts(), repo, 7, payload), 'fromapi');
-  });
-
-  test('a 404 rejects, which is the rejection openCheckRun absorbs', async () => {
-    global.fetch = async () => ghErr(404, 'not found');
-    await assert.rejects(action.resolveHeadSha(makeOpts(), repo, 7, null), /404/);
-  });
-});
-
-describe('findOpenCheckRun', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
-
-  test('queries the commit by check name and returns the id still in flight', async () => {
-    let seen;
-    global.fetch = async (url) => {
-      seen = url;
-      return ghOk({ check_runs: [{ id: 1, status: 'completed' }, { id: 2, status: 'in_progress' }] });
-    };
-    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'TEA Test Review (claude)'), 2);
-    assert.strictEqual(
-      seen,
-      'https://api.github.com/repos/o/r/commits/abc123/check-runs?check_name=TEA%20Test%20Review%20(claude)&per_page=100'
-    );
-  });
-
-  test('a queued run counts as open, so a stalled attempt is adopted rather than duplicated', async () => {
-    global.fetch = async () => ghOk({ check_runs: [{ id: 3, status: 'queued' }] });
-    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), 3);
-  });
-
-  test('only completed runs means nothing to adopt', async () => {
-    global.fetch = async () => ghOk({ check_runs: [{ id: 1, status: 'completed' }] });
-    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), null);
-  });
-
-  test('an open run with no integer id is skipped, so no PATCH is aimed at a guess', async () => {
-    global.fetch = async () => ghOk({ check_runs: [{ id: 'x', status: 'in_progress' }] });
-    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), null);
-  });
-
-  test('a malformed response is null, never a guessed id', async () => {
-    global.fetch = async () => ghOk({});
-    assert.strictEqual(await action.findOpenCheckRun(ctx, 'abc123', 'n'), null);
-  });
-});
-
-describe('createCheckRun', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
-
-  /** Answers the adopt-or-create GET with `check_runs`, and every other call with `body`. */
-  const stub = (calls, body, { existing = [] } = {}) => async (url, init) => {
-    calls.push({ url, method: init.method, body: init.body ? JSON.parse(init.body) : null });
-    return init.method === 'GET' ? ghOk({ check_runs: existing }) : ghOk(body, 201);
-  };
-
-  test('opens the run as in_progress against the head SHA and returns its id', async () => {
-    const calls = [];
-    global.fetch = stub(calls, { id: 55 });
-    const id = await action.createCheckRun(ctx, {
-      headSha: 'abc123',
-      name: 'TEA Test Review (claude)',
-      detailsUrl: RUN_URL,
-    });
-    assert.strictEqual(id, 55);
-    assert.strictEqual(calls.length, 2, 'one adopt-or-create lookup, then one create');
-    assert.strictEqual(calls[1].url, 'https://api.github.com/repos/o/r/check-runs');
-    assert.strictEqual(calls[1].method, 'POST');
-    assert.strictEqual(calls[1].body.head_sha, 'abc123');
-    assert.strictEqual(calls[1].body.status, 'in_progress');
-    assert.strictEqual(calls[1].body.name, 'TEA Test Review (claude)');
-    assert.strictEqual(calls[1].body.details_url, RUN_URL);
-    // A malformed timestamp is a 422 the caller then swallows as a warning, so
-    // the failure mode of getting this wrong is a silently missing check run.
-    assert.match(calls[1].body.started_at, ISO_8601);
-  });
-
-  test('the in-progress output is what the pull request shows for the whole run', async () => {
-    const calls = [];
-    global.fetch = stub(calls, { id: 55 });
-    await action.createCheckRun(ctx, { headSha: 'abc123', name: 'n', detailsUrl: RUN_URL });
-    assert.deepStrictEqual(calls[1].body.output, {
-      title: 'Review in progress',
-      summary: `The TEA test review is running. [Live log](${RUN_URL})`,
-    });
-  });
-
-  test('adopts a run an earlier attempt left open instead of stacking a second under one name', async () => {
-    const calls = [];
-    global.fetch = stub(calls, { id: 99 }, { existing: [{ id: 7, status: 'in_progress' }] });
-    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'abc123', name: 'n', detailsUrl: 'u' }), 7);
-    assert.strictEqual(calls.length, 1, 'the create must not run when an open run was adopted');
-  });
-
-  test('a failed lookup still creates, so the adopt path can never cost the check run', async () => {
-    const calls = [];
-    global.fetch = async (url, init) => {
-      calls.push(init.method);
-      return init.method === 'GET' ? ghErr(403, 'nope') : ghOk({ id: 55 }, 201);
-    };
-    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' }), 55);
-    assert.deepStrictEqual(calls, ['GET', 'POST']);
-  });
-
-  test('a response with no id is null, so nothing is later patched by guess', async () => {
-    global.fetch = stub([], {});
-    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' }), null);
-  });
-
-  test('a non-integer id is null, for the same reason', async () => {
-    global.fetch = stub([], { id: '55' });
-    assert.strictEqual(await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' }), null);
-  });
-
-  test('a 403 on the missing permission warns and returns null: cosmetic, never throws', async () => {
-    global.fetch = async () => ghErr(403, 'Resource not accessible');
-    let id;
-    const logged = await captureStdout(async () => {
-      id = await action.createCheckRun(ctx, { headSha: 'a', name: 'n', detailsUrl: 'u' });
-    });
-    assert.strictEqual(id, null);
-    assert.match(logged, /::warning::Could not create the check run/);
-    assert.match(logged, /checks: write/);
-  });
-});
-
-describe('completeCheckRun', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
-
-  test('patches the run to completed with its conclusion and output', async () => {
-    const calls = [];
-    global.fetch = async (url, init) => {
-      calls.push({ url, method: init.method, body: JSON.parse(init.body) });
-      return ghOk({ id: 55 });
-    };
-    await action.completeCheckRun(ctx, 55, { conclusion: 'success', title: 'Approve', summary: 'all good' });
-    assert.strictEqual(calls.length, 1);
-    assert.strictEqual(calls[0].url, 'https://api.github.com/repos/o/r/check-runs/55');
-    assert.strictEqual(calls[0].method, 'PATCH');
-    assert.strictEqual(calls[0].body.status, 'completed');
-    assert.strictEqual(calls[0].body.conclusion, 'success');
-    assert.deepStrictEqual(calls[0].body.output, { title: 'Approve', summary: 'all good' });
-    assert.match(calls[0].body.completed_at, ISO_8601);
-  });
-
-  test('a null id is a no-op, so a run that was never opened is never patched', async () => {
-    let called = false;
-    global.fetch = async () => {
-      called = true;
-      return ghOk({});
-    };
-    await action.completeCheckRun(ctx, null, { conclusion: 'success', title: 't', summary: 's' });
-    assert.strictEqual(called, false);
-  });
-
-  test('a rejected output is retried bare, so a summary problem cannot pin the run', async () => {
-    const bodies = [];
-    global.fetch = async (url, init) => {
-      const body = JSON.parse(init.body);
-      bodies.push(body);
-      return body.output ? ghErr(422, 'output too large') : ghOk({ id: 55 });
-    };
-    const logged = await captureStdout(() =>
-      action.completeCheckRun(ctx, 55, { conclusion: 'failure', title: 't', summary: 's' })
-    );
-    assert.strictEqual(bodies.length, 2);
-    assert.strictEqual(bodies[1].status, 'completed');
-    assert.strictEqual(bodies[1].conclusion, 'failure');
-    assert.strictEqual(bodies[1].output, undefined);
-    assert.match(bodies[1].completed_at, ISO_8601);
-    assert.match(logged, /::warning::Could not write the check run's summary/);
-  });
-
-  test('both attempts failing warns that the run stays open, and still never throws', async () => {
-    global.fetch = async () => ghErr(404, 'gone');
-    const logged = await captureStdout(() =>
-      action.completeCheckRun(ctx, 55, { conclusion: 'success', title: 't', summary: 's' })
-    );
-    assert.match(logged, /::warning::Could not complete the check run/);
-    assert.match(logged, /stays in progress/);
-  });
-});
-
-describe('openCheckRun', () => {
-  const originalFetch = global.fetch;
-  afterEach(() => {
-    global.fetch = originalFetch;
-  });
-
-  const repo = { owner: 'o', repo: 'r' };
-  const ctx = { owner: 'o', repo: 'r', token: 't', apiUrl: 'https://api.github.com' };
-  const makeOpts = (over = {}) => ({
-    checkRun: true,
-    checkRunName: 'TEA Test Review',
-    token: 't',
-    apiUrl: 'https://api.github.com',
-    prCache: new Map(),
-    agent: { key: 'claude' },
-    ...over,
-  });
-  const env = { GITHUB_SERVER_URL: 'https://github.com', GITHUB_REPOSITORY: 'o/r', GITHUB_RUN_ID: '9' };
-
-  const openWith = (opts, payload, over = {}) => {
-    const bodies = [];
-    global.fetch = async (url, init) => {
-      if (init.method === 'GET') return ghOk({ check_runs: [] });
-      bodies.push(JSON.parse(init.body));
-      return ghOk({ id: 55 }, 201);
-    };
-    return { bodies, run: () => action.openCheckRun(opts, ctx, repo, payload, { ...env, ...over }) };
-  };
-
-  test('opens against the payload head SHA and links this workflow run', async () => {
-    const { bodies, run } = openWith(makeOpts(), { pull_request: { number: 4, head: { sha: 'abc123' } } });
-    assert.strictEqual(await run(), 55);
-    assert.strictEqual(bodies[0].name, 'TEA Test Review');
-    assert.strictEqual(bodies[0].details_url, RUN_URL);
-    assert.strictEqual(bodies[0].head_sha, 'abc123');
-  });
-
-  test('the name never moves with the agent, because branch protection matches it exactly', async () => {
-    // A mention can switch vendors mid-pull-request. A name carrying the vendor
-    // would stop reporting under the name that was required.
-    const a = openWith(makeOpts(), { pull_request: { number: 4, head: { sha: 'abc' } } });
-    await a.run();
-    const b = openWith(makeOpts({ agent: { key: 'codex' } }), { pull_request: { number: 4, head: { sha: 'abc' } } });
-    await b.run();
-    assert.strictEqual(a.bodies[0].name, b.bodies[0].name);
-    assert.match(a.bodies[0].output.summary, /running on claude\./);
-    assert.match(b.bodies[0].output.summary, /running on codex\./);
-  });
-
-  test('a caller-set name wins, so two reviews in one workflow do not share a run', async () => {
-    const { bodies, run } = openWith(makeOpts({ checkRunName: 'TEA Test Review (codex)' }), {
-      pull_request: { number: 4, head: { sha: 'abc' } },
-    });
-    await run();
-    assert.strictEqual(bodies[0].name, 'TEA Test Review (codex)');
-  });
-
-  test('check-run false never touches the API', async () => {
-    let called = false;
-    global.fetch = async () => {
-      called = true;
-      return ghOk({});
-    };
-    assert.strictEqual(await action.openCheckRun(makeOpts({ checkRun: false }), ctx, repo, {}, env), null);
-    assert.strictEqual(called, false);
-  });
-
-  test('an unusable token warns rather than failing silently, matching the comment path', async () => {
-    let called = false;
-    global.fetch = async () => {
-      called = true;
-      return ghOk({});
-    };
-    let id;
-    const logged = await captureStdout(async () => {
-      id = await action.openCheckRun(makeOpts(), null, repo, {}, env);
-    });
-    assert.strictEqual(id, null);
-    assert.strictEqual(called, false);
-    assert.match(logged, /::warning::check-run is enabled but there is no usable github-token/);
-  });
-
-  test('no pull request in context opens nothing', async () => {
-    let called = false;
-    global.fetch = async () => {
-      called = true;
-      return ghOk({});
-    };
-    assert.strictEqual(await action.openCheckRun(makeOpts(), ctx, repo, {}, { ...env, GITHUB_REF: 'refs/heads/main' }), null);
-    assert.strictEqual(called, false);
-  });
-
-  test('a head SHA that cannot be resolved warns and lets the review run without a check', async () => {
-    global.fetch = async () => ghErr(404, 'not found');
-    let id;
-    const logged = await captureStdout(async () => {
-      id = await action.openCheckRun(makeOpts(), ctx, repo, { issue: { number: 4 } }, env);
-    });
-    assert.strictEqual(id, null);
-    assert.match(logged, /::warning::Could not resolve the head SHA of #4/);
-    assert.match(logged, /The review still runs without a check run/);
-  });
-});
-
-describe('clampBytes', () => {
-  test('leaves anything inside the budget untouched', () => {
-    assert.strictEqual(action.clampBytes('short', 100), 'short');
-  });
-
-  test('trims to the budget and says it trimmed', () => {
-    const out = action.clampBytes('x'.repeat(500), 100);
-    assert.ok(Buffer.byteLength(out, 'utf8') <= 100);
-    assert.match(out, /_\(truncated\)_$/);
-  });
-
-  test('counts bytes, because the API limit is bytes and an emoji is four of them', () => {
-    // 30 emoji is 120 bytes and 60 characters: a character-based clamp would
-    // send this through and take a 422.
-    const out = action.clampBytes('🙂'.repeat(30), 60);
-    assert.ok(Buffer.byteLength(out, 'utf8') <= 60);
-  });
-
-  test('never cuts a multi-byte character in half', () => {
-    const out = action.clampBytes('🙂'.repeat(30), 60);
-    assert.ok(!out.includes('\uFFFD'));
-    assert.strictEqual(Buffer.from(out, 'utf8').toString('utf8'), out);
-  });
-
-  test('a null summary is an empty string, never the word "null"', () => {
-    assert.strictEqual(action.clampBytes(null, 100), '');
-  });
-});
-
-describe('retryAfterMs', () => {
-  test('honours the header GitHub sends, because a shorter wait burns another request', () => {
-    assert.strictEqual(action.retryAfterMs({ get: () => '5' }, 1), 5000);
-  });
-
-  test('caps a hostile value so one response cannot stall the job', () => {
-    assert.strictEqual(action.retryAfterMs({ get: () => '99999' }, 1), 60000);
-  });
-
-  test('falls back to the linear backoff when there is no header', () => {
-    assert.strictEqual(action.retryAfterMs({ get: () => null }, 3), 3000);
-    assert.strictEqual(action.retryAfterMs(null, 2), 2000);
-  });
-
-  test('a non-numeric or non-positive header falls back too', () => {
-    assert.strictEqual(action.retryAfterMs({ get: () => 'Wed, 21 Oct 2026 07:28:00 GMT' }, 1), 1000);
-    assert.strictEqual(action.retryAfterMs({ get: () => '0' }, 1), 1000);
-  });
-});
-
-describe('checkRunConclusion', () => {
-  test('a passing verdict is success', () => {
-    assert.strictEqual(action.checkRunConclusion(0, { recommendation: 'Approve' }), 'success');
-  });
-
-  test('a waived failure is still a pass, because the step exited 0', () => {
-    assert.strictEqual(action.checkRunConclusion(0, { waived: true }), 'success');
-  });
-
-  test('a skipped review is neutral: no evidence of quality, and no reason to block', () => {
-    assert.strictEqual(action.checkRunConclusion(0, { skipped: true }), 'neutral');
-  });
-
-  test('a dry run is neutral, because --agent none reviewed nothing', () => {
-    assert.strictEqual(action.checkRunConclusion(0, { promptOnly: true }), 'neutral');
-  });
-
-  test('only a real boolean skips, so a string "true" from a malformed verdict is not one', () => {
-    assert.strictEqual(action.checkRunConclusion(0, { skipped: 'true' }), 'success');
-    assert.strictEqual(action.checkRunConclusion(0, { promptOnly: 'true' }), 'success');
-  });
-
-  test('a verdict failure is failure', () => {
-    assert.strictEqual(action.checkRunConclusion(1, { recommendation: 'Block' }), 'failure');
-  });
-
-  for (const status of [2, 3]) {
-    test(`exit ${status} is a broken gate and is reported as failure, never as a pass`, () => {
-      assert.strictEqual(action.checkRunConclusion(status, null), 'failure');
-    });
   }
 
-  test('a skipped verdict on a non-zero exit is still failure: the exit code wins', () => {
-    assert.strictEqual(action.checkRunConclusion(3, { skipped: true }), 'failure');
+  /** Run main.js the way the composite action does: INPUT_ variables, GITHUB_ variables, a workspace. */
+  async function runAction({ inputs = EVERY_INPUT, event = pullRequestEvent, eventName = 'pull_request', extraEnv = {}, verdict = VERDICT, exit = 0, workspaceSetup } = {}) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tea-test-review-wiring-'));
+    const bin = path.join(root, 'bin');
+    const workspace = path.join(root, 'workspace');
+    fs.mkdirSync(bin);
+    fs.mkdirSync(workspace);
+    makeFakeBin(bin);
+    if (workspaceSetup) workspaceSetup(workspace);
+    fs.writeFileSync(path.join(root, 'event.json'), JSON.stringify(event));
+
+    const env = {
+      PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      HOME: root,
+      FAKE_LOG: path.join(root, 'log.jsonl'),
+      FAKE_EXIT: String(exit),
+      GITHUB_OUTPUT: path.join(root, 'output'),
+      GITHUB_EVENT_PATH: path.join(root, 'event.json'),
+      GITHUB_EVENT_NAME: eventName,
+      GITHUB_WORKSPACE: workspace,
+      GITHUB_REPOSITORY: 'o/r',
+      GITHUB_JOB: 'review',
+      GITHUB_RUN_ID: '9',
+      ...(verdict ? { FAKE_VERDICT: JSON.stringify(verdict) } : {}),
+      ...extraEnv,
+    };
+    for (const [name, value] of Object.entries(inputs)) env[`INPUT_${name.toUpperCase()}`] = value;
+
+    // Asynchronous, because the mention scenarios serve a local GitHub API stub
+    // from this same process.
+    const child = spawn(process.execPath, [MAIN], { env, cwd: workspace });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => (stdout += chunk));
+    child.stderr.on('data', (chunk) => (stderr += chunk));
+    const status = await new Promise((resolve) => child.on('close', resolve));
+
+    const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+    const calls = read(env.FAKE_LOG)
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    const outputs = {};
+    for (const match of read(env.GITHUB_OUTPUT).matchAll(/^(\S+)<<(ghadelimiter_[\w-]+)\n([\s\S]*?)\n\2$/gm)) outputs[match[1]] = match[3];
+    return { status, stdout, stderr, calls, outputs, workspace, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+  }
+
+  const cliCall = (run) => run.calls.find((c) => c.bin === 'tea-test-review');
+
+  test('the fixture sets every input action.yml declares', async () => {
+    assert.deepStrictEqual(Object.keys(EVERY_INPUT).sort(), declaredInputs().sort());
   });
 
-  test('a missing verdict on exit 0 is success, matching the step it mirrors', () => {
-    assert.strictEqual(action.checkRunConclusion(0, null), 'success');
+  test('every input reaches the CLI as the flag it always meant', async () => {
+    const run = await runAction();
+    try {
+      assert.strictEqual(run.status, 0, run.stdout + run.stderr);
+      assert.deepStrictEqual(cliCall(run).argv, [
+        '--agent', 'claude',
+        '--output', 'out/review.md',
+        '--json', 'out/review.json',
+        '--retries', '1',
+        '--base', 'origin/release',
+        '--pr', '7',
+        '--github', '--check-name', 'Tests',
+        '--artifact-name', 'tea-test-review-review-claude',
+        '--model', 'opus',
+        '--agent-arg=--verbose',
+        '--test-dir', 'tests',
+        '--scope', 'suite',
+        '--min-score', '80',
+        '--max-critical', '0',
+        '--min-files', '1',
+        '--fail-on', 'block',
+        '--gate-on', 'introduced',
+        '--use-playwright-utils',
+        '--no-use-pactjs-utils',
+        '--pact-mcp', 'none',
+        '--waive', 'flaky suite',
+        '--waive-until', '2099-01-01',
+      ]);
+    } finally {
+      run.cleanup();
+    }
   });
-});
 
-describe('checkRunReport', () => {
-  const link = `[Full log](${RUN_URL})`;
-
-  test('a skipped review names the reason and links the run', () => {
-    const out = action.checkRunReport(0, { skipped: true, reason: 'no changed test files' }, 'success', RUN_URL);
-    assert.strictEqual(out.title, 'Skipped');
-    assert.strictEqual(out.summary, `No changed test files to review: no changed test files.\n\n${link}`);
+  test('the CLI is installed with the agent in one global install at the tea-version, and the CLI runs in the workspace', async () => {
+    const run = await runAction();
+    try {
+      assert.deepStrictEqual(run.calls[0], {
+        bin: 'npm',
+        argv: ['install', '--global', 'bmad-method-test-architecture-enterprise@1.28.0', '@anthropic-ai/claude-code@2.1.220'],
+      });
+      assert.strictEqual(fs.realpathSync(cliCall(run).cwd), fs.realpathSync(run.workspace));
+      assert.ok(run.calls.findIndex((c) => c.bin === 'tea-test-review') > 0);
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a skip with no reason still reads as a skip, never as "undefined"', () => {
-    const out = action.checkRunReport(0, { skipped: true }, 'success', RUN_URL);
-    assert.strictEqual(out.summary, `No changed test files to review: nothing in the diff to review.\n\n${link}`);
+  test('the token and API URL travel in the environment, the credential reaches the agent, and none is on argv', async () => {
+    const run = await runAction();
+    try {
+      const call = cliCall(run);
+      assert.strictEqual(call.env.GITHUB_TOKEN, 'ghs_test_token');
+      assert.strictEqual(call.env.GITHUB_API_URL, 'https://ghe.example/api/v3');
+      assert.strictEqual(call.env.ANTHROPIC_API_KEY, 'sk-ant-test');
+      assert.ok(!call.argv.join(' ').includes('ghs_test_token'));
+      assert.ok(!call.argv.join(' ').includes('sk-ant-test'));
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a dry run says no review happened, never a score of zero violations', () => {
-    const out = action.checkRunReport(0, { promptOnly: true, files: ['a.test.ts'] }, 'review passed', RUN_URL);
-    assert.strictEqual(out.title, 'No review performed');
-    assert.strictEqual(
-      out.summary,
-      'The CLI ran with `--agent none`, so it built the prompt and stopped. This is a dry run, not a verdict.' +
-        `\n\n${link}`
-    );
+  test('every output is set from the verdict, and the paths are the ones configured', async () => {
+    const run = await runAction();
+    try {
+      assert.deepStrictEqual(run.outputs, {
+        agent: 'claude',
+        recommendation: 'Approve with Comments',
+        'quality-score': '88',
+        'full-quality-score': '88',
+        'raw-quality-score': '91',
+        'gate-on': 'introduced',
+        'review-mode': 'pr',
+        critical: '0',
+        high: '0',
+        medium: '2',
+        low: '1',
+        'reviewed-files': '2',
+        skipped: 'false',
+        'report-path': 'out/review.md',
+        'json-path': 'out/review.json',
+      });
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a passing verdict carries the recommendation, the gating score and the counts', () => {
-    const out = action.checkRunReport(
-      0,
-      {
-        recommendation: 'Approve',
-        gatingQualityScore: 92,
-        gatingViolations: { critical: 0, high: 1, medium: 2, low: 3 },
-        reviewedFiles: ['a.test.ts', 'b.test.ts'],
+  test('every output action.yml declares is one this run sets', async () => {
+    const run = await runAction();
+    try {
+      const outputsSection = ACTION_YML.slice(ACTION_YML.indexOf('\noutputs:'), ACTION_YML.indexOf('\nruns:'));
+      for (const name of [...outputsSection.matchAll(/^  ([a-z-]+):$/gm)].map((m) => m[1])) {
+        assert.ok(name in run.outputs, `output ${name} is declared but never set`);
+      }
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('the CLI exit code is the step exit code, and the action runs the CLI once whatever it exits', async () => {
+    for (const exit of [1, 2, 3]) {
+      const run = await runAction({ exit, verdict: exit === 1 ? VERDICT : null });
+      try {
+        assert.strictEqual(run.status, exit, `exit ${exit}`);
+        assert.strictEqual(run.calls.filter((c) => c.bin === 'tea-test-review').length, 1, 'the CLI owns the retry');
+        assert.match(run.stdout, exit === 1 ? /::error::TEA Test Review failed/ : /::error::TEA Test Review did not produce a verdict.*broken gate/);
+      } finally {
+        run.cleanup();
+      }
+    }
+  });
+
+  test('a CLI that exits before writing a verdict leaves outputs empty rather than stale', async () => {
+    const run = await runAction({
+      exit: 2,
+      verdict: null,
+      workspaceSetup: (workspace) => {
+        fs.mkdirSync(path.join(workspace, 'out'));
+        fs.writeFileSync(path.join(workspace, 'out', 'review.json'), JSON.stringify({ recommendation: 'Approve' }));
       },
-      'success',
-      RUN_URL
-    );
-    assert.strictEqual(out.title, 'Approve');
-    assert.strictEqual(
-      out.summary,
-      `Gating quality score 92/100 across 2 reviewed file(s).\n\n0 critical, 1 high, 2 medium, 3 low.\n\n${link}`
-    );
+    });
+    try {
+      assert.strictEqual(run.status, 2);
+      assert.strictEqual(run.outputs.recommendation, '');
+      assert.strictEqual(run.outputs.critical, '0');
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a gating score of 0 is reported as 0, the falsiest valid score there is', () => {
-    const out = action.checkRunReport(1, { recommendation: 'Block', gatingQualityScore: 0 }, 'verdict failure', RUN_URL);
-    assert.match(out.summary, /^Gating quality score 0\/100 /);
+  test('comment false and check-run false publish nothing and keep the base ref lookup off the API', async () => {
+    const run = await runAction({ inputs: { ...EVERY_INPUT, comment: 'false', 'check-run': 'false' } });
+    try {
+      const argv = cliCall(run).argv;
+      for (const flag of ['--github', '--pr', '--check-name', '--artifact-name']) assert.ok(!argv.includes(flag), `${flag} should be absent`);
+      assert.strictEqual(argv[argv.indexOf('--base') + 1], 'origin/release');
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a waived failure says so, so a green check is never unexplained', () => {
-    const out = action.checkRunReport(0, { recommendation: 'Approve', waived: true, waiveReason: 'hotfix' }, 'success', RUN_URL);
-    assert.match(out.summary, /Verdict failure waived: hotfix\./);
+  test('comment false with check-run on keeps the check run only, and the reverse keeps the comment only', async () => {
+    const noComment = await runAction({ inputs: { ...EVERY_INPUT, comment: 'false' } });
+    const noCheck = await runAction({ inputs: { ...EVERY_INPUT, 'check-run': 'false' } });
+    try {
+      assert.ok(cliCall(noComment).argv.includes('--no-pr-comment'));
+      assert.ok(!cliCall(noComment).argv.includes('--no-check-run'));
+      assert.ok(cliCall(noCheck).argv.includes('--no-check-run'));
+      assert.ok(!cliCall(noCheck).argv.includes('--no-pr-comment'));
+    } finally {
+      noComment.cleanup();
+      noCheck.cleanup();
+    }
   });
 
-  test('a waiver with no reason still reads as a waiver', () => {
-    const out = action.checkRunReport(0, { recommendation: 'Approve', waived: true }, 'success', RUN_URL);
-    assert.match(out.summary, /Verdict failure waived: no reason recorded\./);
+  test('upload-report false names no artifact, so the comment promises none', async () => {
+    const run = await runAction({ inputs: { ...EVERY_INPUT, 'upload-report': 'false' } });
+    try {
+      assert.ok(!cliCall(run).argv.includes('--artifact-name'));
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a waiver is never claimed on a failing exit, because a waived run exits 0', () => {
-    const out = action.checkRunReport(1, { recommendation: 'Block', waived: true, waiveReason: 'hotfix' }, 'verdict failure', RUN_URL);
-    assert.ok(!out.summary.includes('waived'));
+  test('a dry run through extra-args reviews nothing and publishes nothing', async () => {
+    const run = await runAction({ inputs: { ...EVERY_INPUT, 'extra-args': '--agent none' }, verdict: { promptOnly: true, files: ['tests/a.spec.ts'] } });
+    try {
+      assert.strictEqual(run.status, 0, run.stdout);
+      const argv = cliCall(run).argv;
+      assert.ok(!argv.includes('--github'));
+      assert.deepStrictEqual(argv.slice(-2), ['--agent', 'none']);
+      assert.match(run.stdout, /::notice::extra-args select --agent none/);
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a verdict failure keeps its recommendation as the title', () => {
-    const out = action.checkRunReport(1, { recommendation: 'Request Changes', gatingQualityScore: 41 }, 'verdict failure', RUN_URL);
-    assert.strictEqual(out.title, 'Request Changes');
-    assert.match(out.summary, /^Gating quality score 41\/100 /);
+  test('a skipped review is a pass with skipped=true and empty scores', async () => {
+    const run = await runAction({ verdict: { skipped: true, reason: 'no changed test files in diff', recommendation: null, qualityScore: null, files: [], gateOn: 'all' } });
+    try {
+      assert.strictEqual(run.status, 0);
+      assert.strictEqual(run.outputs.skipped, 'true');
+      assert.strictEqual(run.outputs['quality-score'], '');
+      assert.match(run.stdout, /::notice::Review skipped/);
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('a broken gate is reported as broken rather than as a low score', () => {
-    const out = action.checkRunReport(3, null, 'agent or report failure', RUN_URL);
-    assert.strictEqual(out.title, 'Broken gate');
-    assert.strictEqual(
-      out.summary,
-      `The review did not produce a verdict: agent or report failure. Treat this as a broken gate, not as approved tests.\n\n${link}`
-    );
+  test('a tea-version whose CLI predates --github stops before the review with the version to change', async () => {
+    const run = await runAction({ extraEnv: { FAKE_HELP: 'Options:\n  --base <ref>\n' } });
+    try {
+      assert.strictEqual(run.status, 2);
+      assert.strictEqual(cliCall(run), undefined, 'the review must not start');
+      assert.match(run.stdout, /::error::bmad-method-test-architecture-enterprise@1\.28\.0 predates the --github publisher/);
+    } finally {
+      run.cleanup();
+    }
   });
 
-  test('an unreadable verdict on exit 1 falls back to the exit meaning for a title', () => {
-    const out = action.checkRunReport(1, null, 'verdict failure', RUN_URL);
-    assert.strictEqual(out.title, 'verdict failure');
-    assert.strictEqual(
-      out.summary,
-      `Gating quality score not recorded across 0 reviewed file(s).\n\n0 critical, 0 high, 0 medium, 0 low.\n\n${link}`
-    );
+  test('a push run has no pull request, so it publishes nothing and leaves the base to the CLI', async () => {
+    const run = await runAction({
+      inputs: { ...EVERY_INPUT, 'base-ref': '' },
+      eventName: 'push',
+      event: { ref: 'refs/heads/main' },
+      extraEnv: { GITHUB_REF: 'refs/heads/main' },
+    });
+    try {
+      const argv = cliCall(run).argv;
+      for (const flag of ['--github', '--pr', '--base']) assert.ok(!argv.includes(flag), `${flag} should be absent`);
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a pull_request into a release branch states that base, so no API lookup is needed', async () => {
+    const run = await runAction({ inputs: { ...EVERY_INPUT, 'base-ref': '' }, extraEnv: { GITHUB_BASE_REF: 'release/2.0' } });
+    try {
+      const argv = cliCall(run).argv;
+      assert.strictEqual(argv[argv.indexOf('--base') + 1], 'origin/release/2.0');
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  describe('a mention comment', () => {
+    const commentEvent = {
+      issue: { number: 7, pull_request: {} },
+      comment: { id: 55, body: '@codex look hard at the retry paths', author_association: 'MEMBER', user: { type: 'User' } },
+    };
+
+    /** A local stand-in for the GitHub API, recording the reaction POST. */
+    async function withGithubStub(fn) {
+      const requests = [];
+      const server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', () => {
+          requests.push({ method: req.method, url: req.url, auth: req.headers.authorization, body });
+          res.writeHead(201, { 'content-type': 'application/json' });
+          res.end('{}');
+        });
+      });
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      try {
+        await fn(`http://127.0.0.1:${server.address().port}`, requests);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    }
+
+    test('reacts with :eyes:, switches to the mentioned agent, logs it in, and asks the CLI to resolve the base from the PR', async () => {
+      await withGithubStub(async (apiUrl, requests) => {
+        const inputs = {
+          ...EVERY_INPUT,
+          'base-ref': '',
+          'openai-api-key': 'sk-openai-test',
+          'anthropic-api-key': '',
+          'github-api-url': apiUrl,
+          model: 'opus',
+          'agent-args': '--verbose',
+        };
+        const run = await runAction({ inputs, event: commentEvent, eventName: 'issue_comment' });
+        try {
+          assert.strictEqual(run.status, 0, run.stdout + run.stderr);
+          assert.deepStrictEqual(
+            requests.map((r) => [r.method, r.url, r.auth, r.body]),
+            [['POST', '/repos/o/r/issues/comments/55/reactions', 'bearer ghs_test_token', '{"content":"eyes"}']]
+          );
+          const order = run.calls.map((c) => c.bin);
+          assert.deepStrictEqual(order, ['npm', 'codex', 'tea-test-review']);
+          const login = run.calls.find((c) => c.bin === 'codex');
+          assert.deepStrictEqual(login.argv, ['login', '--with-api-key']);
+          assert.strictEqual(login.stdin, 'sk-openai-test\n');
+          const argv = cliCall(run).argv;
+          assert.strictEqual(argv[argv.indexOf('--agent') + 1], 'codex');
+          assert.strictEqual(argv[argv.indexOf('--pr') + 1], '7');
+          assert.ok(!argv.includes('--base'), 'the CLI resolves the base from --pr');
+          assert.strictEqual(argv[argv.indexOf('--focus') + 1], 'look hard at the retry paths');
+          assert.ok(!argv.includes('--model'), 'a vendor switch resets the per-vendor model');
+          assert.ok(!argv.includes('--agent-arg=--verbose'), 'a vendor switch resets agent-args');
+          assert.strictEqual(argv[argv.indexOf('--artifact-name') + 1], 'tea-test-review-review-codex');
+          assert.strictEqual(run.outputs.agent, 'codex');
+        } finally {
+          run.cleanup();
+        }
+      });
+    });
   });
 });
-describe('fenceLeadingFrontmatter', () => {
-  test('fences a leading frontmatter block and leaves the body untouched', () => {
-    const out = action.fenceLeadingFrontmatter("---\na: 1\nb: 2\n---\n\n# Title\n\ntext\n");
-    assert.strictEqual(out, "```yaml\na: 1\nb: 2\n```\n\n# Title\n\ntext\n");
-  });
 
-  test('a thematic break inside the body is not mistaken for frontmatter', () => {
-    const text = '# Title\n\n---\n\nsection\n';
-    assert.strictEqual(action.fenceLeadingFrontmatter(text), text);
-  });
-
-  test('an unclosed leading marker is left alone rather than half-fenced', () => {
-    const text = '---\na: 1\n\n# Title\n';
-    assert.strictEqual(action.fenceLeadingFrontmatter(text), text);
-  });
-
-  test('frontmatter containing a fence is left alone, so ours cannot end early', () => {
-    const text = '---\nnote: "```"\n---\n\n# Title\n';
-    assert.strictEqual(action.fenceLeadingFrontmatter(text), text);
-  });
-
-  test('a missing report is a string, not a crash', () => {
-    assert.strictEqual(action.fenceLeadingFrontmatter(null), '');
-  });
-});

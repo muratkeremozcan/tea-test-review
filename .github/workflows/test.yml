@@ -1,9 +1,9 @@
 # The `unit` job always runs and needs no secret and no dependency install.
 #
 # The `smoke` job runs the action against this repository's own test file, which
-# is the only way to prove the parts unit tests cannot reach: the npm pack and
-# tar unpack, the global install, the real CLI invocation, and the live PR
-# comment write.
+# is the only way to prove the parts unit tests cannot reach: the global install
+# of the real CLI, its real invocation, and the live PR comment and check run
+# the CLI writes.
 #
 # NOT YET ENABLED: no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN repository
 # secret exists yet, so the smoke job detects their absence and reports that it
@@ -77,10 +77,10 @@ jobs:
           fi
 
       # --agent none through extra-args: the CLI builds the prompt and stops, so
-      # this costs no tokens and no minutes. It still exercises npm pack, the tar
-      # unpack, the global install, the CLI argv, and the comment create path.
-      # First, so the run below proves the update path rather than the create one.
-      - name: Dry run, creating the comment
+      # this costs no tokens and no minutes. It still exercises the global
+      # install, the CLI argv and the packaged skill. The CLI refuses to publish
+      # a review that never ran, so a dry run writes no comment and no check run.
+      - name: Dry run, installing and building the prompt
         if: steps.creds.outputs.present == 'true'
         uses: ./
         with:
@@ -92,7 +92,7 @@ jobs:
       # min-files 0 because a commit that changes no test file skips the review,
       # and a skip must not fail this job. fail-on block so only the worst verdict
       # reds this repo's own PRs; the verdict is being exercised, not enforced.
-      - name: Live review, updating the same comment
+      - name: Live review, creating the comment and the check run
         id: review
         if: steps.creds.outputs.present == 'true'
         uses: ./
@@ -107,9 +107,10 @@ jobs:
       # every run, so this job exercises that path twice (the dry run's artifact
       # is overwritten by the live review's, which is the copy worth keeping).
 
-      # One comment carrying the marker, not two. Upserting is what keeps a PR
-      # with ten pushes from collecting ten reviews, and the lookup that makes it
-      # work is the one path a stubbed fetch cannot prove.
+      # Exactly one comment carrying the marker: the live review published it and
+      # the dry run published nothing. Every later push to this PR runs the CLI's
+      # upsert against it, whose race and legacy-marker rules the CLI's own suite
+      # tests.
       - name: Assert the second run updated rather than duplicated
         if: always() && steps.creds.outputs.present == 'true' && github.event_name == 'pull_request'
         env:
