@@ -51,11 +51,11 @@ unknown-option error mid-run. A workflow that pins `tea-version` to a release
 without those features now fails there with exit 2; move the pin to a release
 whose CLI lists `--github`.
 
-Pin an exact version or a tarball URL when the verdict has to be reproducible:
+`latest` is 2.0.0 or newer, the first release whose CLI has these flags. Pin an exact version or a tarball URL when the verdict has to be reproducible:
 
 ```yaml
 with:
-  tea-version: "<a release or tarball whose CLI lists --github>"
+  tea-version: "2.0.0"
 ```
 
 ## Proven configurations

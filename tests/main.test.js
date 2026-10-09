@@ -1484,7 +1484,7 @@ describe('an existing workflow runs unchanged', { skip: process.platform === 'wi
     'agent-command': '',
     model: 'opus',
     'agent-args': '--verbose',
-    'tea-version': '1.28.0',
+    'tea-version': '2.0.0',
     'claude-code-version': '2.1.220',
     'codex-version': 'latest',
     'base-ref': 'origin/release',
@@ -1641,7 +1641,7 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     try {
       assert.deepStrictEqual(run.calls[0], {
         bin: 'npm',
-        argv: ['install', '--global', 'bmad-method-test-architecture-enterprise@1.28.0', '@anthropic-ai/claude-code@2.1.220'],
+        argv: ['install', '--global', 'bmad-method-test-architecture-enterprise@2.0.0', '@anthropic-ai/claude-code@2.1.220'],
       });
       assert.strictEqual(fs.realpathSync(cliCall(run).cwd), fs.realpathSync(run.workspace));
       assert.ok(run.calls.findIndex((c) => c.bin === 'tea-test-review') > 0);
@@ -1782,7 +1782,7 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     const run = await runAction({ inputs });
     try {
       assert.strictEqual(run.status, 0, run.stdout + run.stderr);
-      assert.deepStrictEqual(run.calls[0].argv, ['install', '--global', 'bmad-method-test-architecture-enterprise@1.28.0', '@google/gemini-cli@0.5.0']);
+      assert.deepStrictEqual(run.calls[0].argv, ['install', '--global', 'bmad-method-test-architecture-enterprise@2.0.0', '@google/gemini-cli@0.5.0']);
       const argv = cliCall(run).argv;
       assert.deepStrictEqual(argv.slice(0, 2), ['--agent', 'claude']);
       assert.strictEqual(argv[argv.indexOf('--agent-cmd') + 1], 'gemini');
@@ -1958,7 +1958,7 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     try {
       assert.strictEqual(run.status, 2);
       assert.strictEqual(cliCall(run), undefined, 'the review must not start');
-      assert.match(run.stdout, /::error::bmad-method-test-architecture-enterprise@1\.28\.0 predates --github/);
+      assert.match(run.stdout, /::error::bmad-method-test-architecture-enterprise@2\.0\.0 predates --github/);
     } finally {
       run.cleanup();
     }
