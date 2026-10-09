@@ -183,8 +183,12 @@ const hasExtraFlag = (extraArgs, flag) => extraArgs.some((arg) => arg === flag |
  * custom vendor never shares claude's or codex's comment.
  */
 function agentTag(key) {
-  let tag = String(key).replace(/[^\w.-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '');
+  const raw = String(key);
+  let tag = raw.replace(/[^\w.-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '');
   if (!tag || Object.hasOwn(AGENTS, tag)) tag = `custom-${tag || 'agent'}`;
+  // Sanitizing can map two keys (`@acme/reviewer`, `@acme-reviewer`) to one tag, so a key it
+  // changed carries a short stable suffix of the original, and two vendors never share a comment.
+  if (tag !== raw) tag = `${tag}-${crypto.createHash('sha1').update(raw).digest('hex').slice(0, 6)}`;
   return tag;
 }
 

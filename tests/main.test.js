@@ -469,25 +469,33 @@ describe('agentLogin', () => {
 
 describe('agentTag, through resolveAgent', () => {
   const tagOf = (key) => action.resolveAgent({ agent: key, agentPackage: 'p@1', agentKeyEnv: 'K' }).tag;
+  const valid = /^[A-Za-z0-9][\w.-]*$/;
 
   test('a built-in keeps its key', () => {
     assert.strictEqual(action.resolveAgent({ agent: 'codex' }).tag, 'codex');
   });
 
-  test('free text becomes letters, digits, dots, dashes and underscores, starting with a letter or digit', () => {
-    assert.strictEqual(tagOf('@acme/reviewer'), 'acme-reviewer');
-    assert.strictEqual(tagOf('./bin/x'), 'bin-x');
-    assert.strictEqual(tagOf('Acme Reviewer'), 'Acme-Reviewer');
+  test('a key that is already a valid tag is used as it is', () => {
+    assert.strictEqual(tagOf('gemini'), 'gemini');
     assert.strictEqual(tagOf('my_agent.v2'), 'my_agent.v2');
   });
 
-  test('a key that would land on a built-in tag is prefixed, so it never shares that agent\'s comment', () => {
-    assert.strictEqual(tagOf('@claude'), 'custom-claude');
-    assert.strictEqual(tagOf('codex/'), 'codex-');
+  test('free text becomes a tag the CLI accepts, with a stable suffix of the original key', () => {
+    for (const key of ['@acme/reviewer', './bin/x', 'Acme Reviewer', '@@@', '@claude', 'codex/']) {
+      assert.match(tagOf(key), valid, key);
+      assert.strictEqual(tagOf(key), tagOf(key), `${key} is stable`);
+    }
+    assert.match(tagOf('@acme/reviewer'), /^acme-reviewer-[0-9a-f]{6}$/);
   });
 
-  test('a key with nothing usable still gets a tag', () => {
-    assert.strictEqual(tagOf('@@@'), 'custom-agent');
+  test('two keys that sanitize alike keep distinct tags, so two vendors never share a comment', () => {
+    assert.notStrictEqual(tagOf('@acme/reviewer'), tagOf('@acme-reviewer'));
+  });
+
+  test('a key that would land on a built-in tag never shares that agent\'s comment', () => {
+    for (const key of ['@claude', 'claude/', '@codex']) {
+      assert.ok(!['claude', 'codex'].includes(tagOf(key)), key);
+    }
   });
 });
 
@@ -1801,10 +1809,11 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     const run = await runAction({ inputs });
     try {
       const argv = cliCall(run).argv;
-      assert.strictEqual(argv[argv.indexOf('--publish-as') + 1], 'acme-reviewer');
-      assert.strictEqual(argv[argv.indexOf('--artifact-name') + 1], 'tea-test-review-review-acme-reviewer');
+      const tag = argv[argv.indexOf('--publish-as') + 1];
+      assert.match(tag, /^acme-reviewer-[0-9a-f]{6}$/);
+      assert.strictEqual(argv[argv.indexOf('--artifact-name') + 1], `tea-test-review-review-${tag}`);
       assert.strictEqual(run.outputs.agent, '@acme/reviewer');
-      assert.strictEqual(run.outputs['agent-tag'], 'acme-reviewer');
+      assert.strictEqual(run.outputs['agent-tag'], tag);
     } finally {
       run.cleanup();
     }
