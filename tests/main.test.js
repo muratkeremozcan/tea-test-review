@@ -467,6 +467,30 @@ describe('agentLogin', () => {
   });
 });
 
+describe('agentTag, through resolveAgent', () => {
+  const tagOf = (key) => action.resolveAgent({ agent: key, agentPackage: 'p@1', agentKeyEnv: 'K' }).tag;
+
+  test('a built-in keeps its key', () => {
+    assert.strictEqual(action.resolveAgent({ agent: 'codex' }).tag, 'codex');
+  });
+
+  test('free text becomes letters, digits, dots, dashes and underscores, starting with a letter or digit', () => {
+    assert.strictEqual(tagOf('@acme/reviewer'), 'acme-reviewer');
+    assert.strictEqual(tagOf('./bin/x'), 'bin-x');
+    assert.strictEqual(tagOf('Acme Reviewer'), 'Acme-Reviewer');
+    assert.strictEqual(tagOf('my_agent.v2'), 'my_agent.v2');
+  });
+
+  test('a key that would land on a built-in tag is prefixed, so it never shares that agent\'s comment', () => {
+    assert.strictEqual(tagOf('@claude'), 'custom-claude');
+    assert.strictEqual(tagOf('codex/'), 'codex-');
+  });
+
+  test('a key with nothing usable still gets a tag', () => {
+    assert.strictEqual(tagOf('@@@'), 'custom-agent');
+  });
+});
+
 describe('resolveAgent', () => {
   test('claude is built in and takes its version from claude-code-version', () => {
     const agent = action.resolveAgent({ agent: 'claude', agentVersions: { claude: 'latest' } });
@@ -984,20 +1008,24 @@ describe('assertCliIsCurrent', () => {
   const helpOf = (stdout) => () => ({ status: 0, stdout });
 
   test('accepts a CLI whose help lists --github and --publish-as', () => {
-    assert.doesNotThrow(() => action.assertCliIsCurrent('2.0.0', helpOf('Options:\n  --github  publish\n  --publish-as <tag>  identity\n')));
+    assert.doesNotThrow(() => action.assertCliIsCurrent('2.0.0', { publishAs: true }, helpOf('Options:\n  --github  publish\n  --publish-as <tag>  identity\n')));
+  });
+
+  test('a built-in agent needs only --github, so the newer flag does not block it', () => {
+    assert.doesNotThrow(() => action.assertCliIsCurrent('1.28.0', {}, helpOf('Options:\n  --github  publish\n')));
   });
 
   test('a CLI that predates --github fails with the version to change, not an unknown-option error', () => {
-    assert.throws(() => action.assertCliIsCurrent('1.27.2', helpOf('Options:\n  --base <ref>\n')), /1\.27\.2 predates --github and --publish-as.*tea-version/s);
+    assert.throws(() => action.assertCliIsCurrent('1.27.2', { publishAs: true }, helpOf('Options:\n  --base <ref>\n')), /1\.27\.2 predates --github and --publish-as.*tea-version/s);
   });
 
   test('a CLI with --github but no --publish-as is refused too, because a custom vendor would share claude\'s comment', () => {
-    assert.throws(() => action.assertCliIsCurrent('1.28.0', helpOf('Options:\n  --github  publish\n')), /predates --publish-as/);
+    assert.throws(() => action.assertCliIsCurrent('1.28.0', { publishAs: true }, helpOf('Options:\n  --github  publish\n')), /predates --publish-as/);
   });
 
   test('a package that ships no CLI names the cause instead of a bare ENOENT', () => {
     const missing = () => ({ error: Object.assign(new Error('spawn tea-test-review ENOENT'), { code: 'ENOENT' }) });
-    assert.throws(() => action.assertCliIsCurrent('1.5.0', missing), /could not start after installing .*@1\.5\.0.*ships the tea-test-review CLI/s);
+    assert.throws(() => action.assertCliIsCurrent('1.5.0', {}, missing), /could not start after installing .*@1\.5\.0.*ships the tea-test-review CLI/s);
   });
 });
 
@@ -1277,7 +1305,7 @@ describe('action.yml defaults', () => {
     // artifact name has to read the resolved value from the review step's
     // own output, the same source the --artifact-name flag uses, or the two diverge
     // the moment a mention switches the agent.
-    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent \}\}/);
+    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent-tag \}\}/);
   });
 });
 
@@ -1641,6 +1669,7 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     try {
       assert.deepStrictEqual(run.outputs, {
         agent: 'claude',
+        'agent-tag': 'claude',
         recommendation: 'Approve with Comments',
         'quality-score': '88',
         'full-quality-score': '88',
@@ -1762,6 +1791,20 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
       assert.strictEqual(argv[argv.indexOf('--artifact-name') + 1], 'tea-test-review-review-gemini');
       assert.match(run.stdout, /::warning::Agent "gemini" is not a built-in vendor/);
       assert.strictEqual(run.outputs.agent, 'gemini');
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a free-text agent key becomes a tag the CLI and upload-artifact accept, on the flag and in the artifact name', async () => {
+    const inputs = { ...EVERY_INPUT, agent: '@acme/reviewer', 'anthropic-api-key': '', 'agent-package': '@acme/reviewer@1.0.0', 'agent-command': 'my-agent', 'agent-key-env': 'ACME_KEY', 'agent-api-key': 'k', model: '', 'agent-args': '' };
+    const run = await runAction({ inputs });
+    try {
+      const argv = cliCall(run).argv;
+      assert.strictEqual(argv[argv.indexOf('--publish-as') + 1], 'acme-reviewer');
+      assert.strictEqual(argv[argv.indexOf('--artifact-name') + 1], 'tea-test-review-review-acme-reviewer');
+      assert.strictEqual(run.outputs.agent, '@acme/reviewer');
+      assert.strictEqual(run.outputs['agent-tag'], 'acme-reviewer');
     } finally {
       run.cleanup();
     }
@@ -1915,7 +1958,7 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     try {
       assert.strictEqual(run.status, 2);
       assert.strictEqual(cliCall(run), undefined, 'the review must not start');
-      assert.match(run.stdout, /::error::bmad-method-test-architecture-enterprise@1\.28\.0 predates --github and --publish-as/);
+      assert.match(run.stdout, /::error::bmad-method-test-architecture-enterprise@1\.28\.0 predates --github/);
     } finally {
       run.cleanup();
     }

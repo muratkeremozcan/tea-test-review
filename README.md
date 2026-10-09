@@ -299,8 +299,9 @@ never costs you the review.
 and check run whenever the CLI got far enough to publish them (a failure in the
 action before the CLI starts, that is the npm install or a `tea-version` too old
 for the flags the action passes, publishes neither; a missing credential or a
-failed agent login does reach the pull request, because the CLI checks the agent
-and publishes that exit 2). Neither is ever reported as approved tests. The CLI retries exit `3` once
+failed agent login does reach the pull request, because the CLI checks a built-in
+agent and publishes that exit 2; a custom vendor's missing key surfaces as exit 3
+when the agent runs, published the same way). Neither is ever reported as approved tests. The CLI retries exit `3` once
 (the action passes `--retries 1`; a fresh agent invocation, not a report
 re-parse) before giving up: a crashed agent process is often a one-off blip
 rather than a real problem with the diff. `1` and `2` are never retried; a

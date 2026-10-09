@@ -176,6 +176,19 @@ function extraArgValue(extraArgs, flag) {
 const hasExtraFlag = (extraArgs, flag) => extraArgs.some((arg) => arg === flag || arg.startsWith(`${flag}=`));
 
 /**
+ * The key as a tag the CLI's comment marker and an artifact name can carry. The
+ * `agent` input is free text (`@acme/reviewer`); the CLI refuses a `--publish-as`
+ * outside letters, digits, dots, dashes and underscores, and upload-artifact
+ * refuses a `/`. A tag that would land on a built-in's name is prefixed so a
+ * custom vendor never shares claude's or codex's comment.
+ */
+function agentTag(key) {
+  let tag = String(key).replace(/[^\w.-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '');
+  if (!tag || Object.hasOwn(AGENTS, tag)) tag = `custom-${tag || 'agent'}`;
+  return tag;
+}
+
+/**
  * Resolve the vendor into an install spec, an executable, a credential variable
  * and the `--agent` value the CLI understands (`cliAgent`). They diverge once:
  * an unknown vendor is not in the CLI's adapter table, so it runs as claude's
@@ -191,6 +204,7 @@ function resolveAgent({ agent, agentPackage, agentCommand, agentKeyEnv, agentVer
     const packageSpec = agentPackage || (version ? `${known.package}@${version}` : known.package);
     return {
       key,
+      tag: key,
       cliAgent: key,
       verified: true,
       packageSpec,
@@ -216,6 +230,7 @@ function resolveAgent({ agent, agentPackage, agentCommand, agentKeyEnv, agentVer
   }
   return {
     key,
+    tag: agentTag(key),
     cliAgent: 'claude',
     verified: false,
     packageSpec: agentPackage,
@@ -254,7 +269,7 @@ function resolveCredential(inputs, agent, env = process.env) {
     `no credential for the ${agent.key} agent: set one of ${agent.credentialEnvNames.join(' or ')}, ` +
       'as an input or in the step\'s env. Fork pull requests receive no secrets, so guard this job with ' +
       "`if: github.event.pull_request.head.repo.full_name == github.repository` on the caller's side. " +
-      'The review stops with exit 2 unless the agent is already logged in.'
+      'The review stops, as a published broken gate, unless the agent is already logged in.'
   );
   return null;
 }
@@ -440,7 +455,7 @@ function agentLogin(agent, credential) {
  * its `--help` names the options it really has. A package with no
  * tea-test-review bin lands here as "could not start".
  */
-function assertCliIsCurrent(teaVersion, runner = spawnSync) {
+function assertCliIsCurrent(teaVersion, { publishAs = false } = {}, runner = spawnSync) {
   const help = runner(binaryName('tea-test-review'), ['--help'], { encoding: 'utf8' });
   const spec = teaInstallSource(teaVersion);
   if (help.error) {
@@ -449,7 +464,7 @@ function assertCliIsCurrent(teaVersion, runner = spawnSync) {
         'Set tea-version to a release that ships the tea-test-review CLI.'
     );
   }
-  const missing = ['--github', '--publish-as'].filter((flag) => !String(help.stdout).includes(flag));
+  const missing = ['--github', ...(publishAs ? ['--publish-as'] : [])].filter((flag) => !String(help.stdout).includes(flag));
   if (missing.length > 0) {
     throw new Error(
       `${spec} predates ${missing.join(' and ')}, which this action drives, so its CLI cannot post the comment or the check run under the right identity. ` +
@@ -691,12 +706,12 @@ function planCliArgs(opts, prNumber, env = process.env) {
       agentCommand: opts.agent.command,
       envPass: opts.agent.needsEnvPass ? opts.agent.credentialEnvNames[0] : '',
       // A custom vendor runs as --agent claude; its own tag keeps its comment from sharing claude's.
-      publishAs: opts.agent.key === opts.agent.cliAgent ? '' : opts.agent.key,
+      publishAs: opts.agent.verified ? '' : opts.agent.tag,
       comment: opts.comment,
       checkRun: opts.checkRun,
       checkRunName: opts.checkRunName,
       // Must match the upload step's name in action.yml; a test pins the two.
-      artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}-${opts.agent.key}` : null,
+      artifactName: opts.uploadReport && env.GITHUB_JOB ? `tea-test-review-${env.GITHUB_JOB}-${opts.agent.tag}` : null,
     }),
   };
 }
@@ -730,6 +745,7 @@ async function run(env = process.env) {
 
   // Set before anything can fail: the upload step names the artifact from it, including after a mention switch.
   setOutput('agent', opts.agent.key);
+  setOutput('agent-tag', opts.agent.tag);
 
   const { plan, args } = planCliArgs(opts, resolvePrNumber(payload, env), env);
   log(`TEA Test Review: ${teaInstallSource(opts.teaVersion)}, agent ${opts.agent.key} (${opts.agent.packageSpec})`);
@@ -753,7 +769,7 @@ async function run(env = process.env) {
 
   // The CLI carries its own review skill: one install, one version, out of the pull request's reach.
   installCli(opts.teaVersion, opts.agent.packageSpec);
-  assertCliIsCurrent(opts.teaVersion);
+  assertCliIsCurrent(opts.teaVersion, { publishAs: !opts.agent.verified });
   agentLogin(opts.agent, opts.credential);
 
   const { status, verdict } = runReviewCli(opts, args);

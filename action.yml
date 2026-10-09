@@ -339,8 +339,10 @@ inputs:
       (the npm install, a tea-version whose CLI lacks `--github` or
       `--publish-as`) opens no check run, and a required check stays Expected
       until a later run reports it. A missing credential or a failed agent login
-      does not stop the action: the CLI finds the agent logged out, exits 2 with
-      the remedy, and publishes that as a broken gate.
+      does not stop the action: the CLI finds a built-in agent logged out, exits 2
+      with the remedy, and publishes that as a broken gate. A custom vendor is
+      only checked for being installed, so a missing key surfaces as exit 3 when
+      the agent runs, published the same way.
 
       A check run that cannot be created is a warning, never a failure, on the
       same contract as the comment. The Checks API needs a GitHub App
@@ -533,7 +535,7 @@ runs:
       if: always() && inputs.upload-report == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent }}
+        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent-tag }}
         path: |
           ${{ inputs.report-path }}
           ${{ inputs.json-path }}
