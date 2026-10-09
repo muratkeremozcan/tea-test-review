@@ -33,7 +33,7 @@ inputs:
       repository's secrets and checks out the PR's code, so this gate is what
       stands between a stranger and your API key on a public repository. Text
       after the mention is handed to the reviewer as a focus note, capped at
-      1000 characters (requires a tea-version whose CLI understands --focus).
+      1000 characters.
 
       Requires the workflow to trigger on issue_comment, and the action's own
       checkout lands the PR's merge ref for those runs.
@@ -126,9 +126,8 @@ inputs:
       generations: the CLI's defaults are aliases that follow the vendor's
       current model in that tier.
 
-      Requires a tea-version whose CLI understands --model; an older CLI fails
-      with an unknown-option error. The model that actually ran is recorded in
-      the verdict JSON as `model`.
+      Ignored for a dry run (`--agent none` in extra-args), which runs no agent.
+      The model that actually ran is recorded in the verdict JSON as `model`.
 
       Note for custom vendors: the review CLI now includes a model flag in the
       fixed argv it hands the agent, so a wrapper impersonating claude's
@@ -142,7 +141,7 @@ inputs:
       the review CLI's repeated --agent-arg option. Use this for vendor-specific
       execution settings such as Codex `-c model_reasoning_effort=low`.
 
-      Requires a tea-version whose CLI understands --agent-arg. Arguments keep
+      Arguments keep
       their declared order and are forwarded to whichever agent is selected.
     required: false
     default: ''
@@ -150,18 +149,19 @@ inputs:
   # ─── dependency versions ────────────────────────────────────────────────────
   tea-version:
     description: |
-      Version or dist-tag of bmad-method-test-architecture-enterprise supplying
-      both the CLI and the review skill. Defaults to `latest`, which tracks the
-      newest published release.
+      Where the `tea-test-review` CLI comes from: a version or dist-tag of
+      bmad-method-test-architecture-enterprise, a tarball URL, or a path to a
+      tarball (an `npm pack` of the package). The CLI carries its own review
+      skill, so the skill and the CLI are always one version.
 
-      Pin an exact version when you need a reproducible verdict: this is the
-      reviewer's control plane, and `latest` means whatever resolves on the day
-      a pull request lands.
+      The CLI has to be one whose `tea-test-review --help` lists `--github`: the
+      action drives `--github`, `--pr`, `--retries` and the rendered comment.
+      The action checks that after installing and fails with that explanation
+      before the review starts.
 
-      It has to be a version that ships the tea-test-review bin. 1.20.0 is the
-      first that does; earlier releases publish the review skill with an empty
-      `bin`. The action checks the unpacked tarball and fails with that
-      explanation before installing anything. See README.md.
+      Pin an exact version or a tarball URL when you need a reproducible
+      verdict: this is the reviewer's control plane, and a dist-tag means
+      whatever it resolves to on the day a pull request lands.
     required: false
     default: 'latest'
   claude-code-version:
@@ -187,11 +187,12 @@ inputs:
     description: |
       Git ref the changed-test diff is taken against. Defaults to
       origin/<the PR base branch>: read from GITHUB_BASE_REF on a pull_request
-      event, and resolved through the pulls API on an issue_comment run, which
-      carries no base ref of its own. When neither source can answer (a push
-      or dispatch run), origin/main is assumed. A failed API lookup fails the
-      step rather than diffing against the wrong base; set this input to
-      bypass the lookup. Needs a full-history checkout (fetch-depth: 0).
+      event, and resolved by the CLI through the pulls API (`--pr`) on an
+      issue_comment run, which carries no base ref of its own. When neither
+      source can answer (a push or dispatch run), the CLI assumes origin/main.
+      A failed API lookup fails the step rather than diffing against the wrong
+      base; set this input to bypass the lookup. Needs a full-history checkout
+      (fetch-depth: 0).
     required: false
     default: ''
   test-dir:
@@ -229,9 +230,9 @@ inputs:
     default: ''
 
   # ─── TEA config keys ────────────────────────────────────────────────────────
-  # Stated rather than left to resolution on purpose. CI installs the skill from
-  # a tarball, so no _bmad/tea/config.yaml exists and an unstated key is one the
-  # agent settles per run: identical files then get reviewed against different
+  # Stated rather than left to resolution on purpose. CI reviews with the skill
+  # packaged in the CLI, so no _bmad/tea/config.yaml exists and an unstated key
+  # is one the agent settles per run: identical files then get reviewed against different
   # knowledge. Empty means "let the CLI resolve it", which is the documented
   # module default and is correct for most repositories; a contract-testing repo
   # that leaves use-pactjs-utils empty silently loses its pactjs-utils fragments.
@@ -258,10 +259,15 @@ inputs:
     description: |
       Arguments appended to the tea-test-review command verbatim, for flags this
       action does not model: --files, --test-glob, --timeout-ms, --fail-on-skip,
-      --waive/--waive-until, --isolate/--no-isolate, --env-pass. Use agent-args
-      for selected-agent configuration.
+      --waive/--waive-until, --isolate/--no-isolate, --env-pass, --retries.
+      Use agent-args for selected-agent configuration. They come last, so they
+      override a flag the action passed earlier.
+
+      `--agent none` makes a dry run: the CLI builds the prompt and reviews
+      nothing, and refuses to publish a review that never ran, so a dry run
+      posts no comment and no check run.
       Quoted like a shell argument list, e.g.
-      --waive "flaky suite, ticket FP-1234" --waive-until 2026-09-30
+      --waive "flaky suite, ticket FP-1234" --waive-until 2030-01-01
     required: false
     default: ''
 
@@ -276,20 +282,24 @@ inputs:
     default: 'test-review.json'
   upload-report:
     description: |
-      Upload report-path and json-path as the tea-test-review-<job> artifact on
-      the workflow run, even when the verdict fails, so a report too large to
-      inline in the PR comment is still recoverable after the runner is
-      deleted. Set to 'false' to manage artifacts yourself.
+      Upload report-path and json-path as the tea-test-review-<job>-<agent>
+      artifact on the workflow run, even when the verdict fails. The comment
+      carries only the verdict and up to three gating findings, so the artifact
+      is where the full report lives, and the comment names it. Set to 'false'
+      to manage artifacts yourself.
     required: false
     default: 'true'
 
   # ─── PR comment ─────────────────────────────────────────────────────────────
   comment:
     description: |
-      Publish the verdict as a PR comment, upserted on a hidden marker so a
-      pushed commit updates one comment instead of appending another. Needs
-      `pull-requests: write`. Silently does nothing when there is no pull request
-      in context.
+      Publish the verdict as a PR comment, written by the CLI (`--github`) and
+      upserted on a hidden marker so a pushed commit updates one comment instead
+      of appending another. Needs `pull-requests: write`. Does nothing when there
+      is no pull request in context. The comment is short: the gate verdict, the
+      reviewed commit and up to three of the findings that affect it; the full
+      report is in the uploaded artifact (or at report-path when upload-report
+      is false).
 
       A comment that cannot be posted is a warning, never a failure: the verdict
       is the step's exit code, and losing the comment must not turn a passing
@@ -301,9 +311,9 @@ inputs:
     default: 'true'
   check-run:
     description: |
-      Publish a check run against the pull request's head commit, opened as
-      `in_progress` before the review starts and closed with its verdict. Needs
-      `checks: write`.
+      Publish a check run against the pull request's head commit, opened by the
+      CLI as `in_progress` before the review starts and closed with its verdict.
+      Needs `checks: write`.
 
       This is the only way a mention-triggered review is visible while it runs.
       An `issue_comment` workflow is repository-scoped, so GitHub binds its
@@ -312,7 +322,7 @@ inputs:
 
       The conclusion mirrors the step's exit code: `success` on a passing
       verdict, `failure` on a failing one and on a broken gate, `neutral` on a
-      skipped review and on an `--agent none` dry run. GitHub counts `neutral`
+      skipped review. A dry run (`--agent none`) publishes no check run. GitHub counts `neutral`
       as satisfying a required check, which is the intent: a review that never
       ran is no evidence of quality, and no reason to block a pull request that
       changed no tests.
@@ -323,9 +333,16 @@ inputs:
       one. And a check run left `in_progress` blocks the merge until it closes:
       a run killed outright, by a cancel or by the runner itself, leaves nothing
       alive to close it, and a `checks: write` that was never granted opens
-      nothing at all. A later run on the same commit adopts an open check run
-      rather than stacking a second one under the same name, so a re-run clears
-      the first case.
+      nothing at all. A later run of the same agent on the same commit adopts the
+      check run it left open rather than stacking a second one under the same
+      name, so a re-run clears the first case. A failure before the CLI starts
+      (the npm install, a tea-version whose CLI lacks `--github` or
+      `--publish-as`) opens no check run, and a required check stays Expected
+      until a later run reports it. A missing credential or a failed agent login
+      does not stop the action: the CLI finds a built-in agent logged out, exits 2
+      with the remedy, and publishes that as a broken gate. A custom vendor is
+      only checked for being installed, so a missing key surfaces as exit 3 when
+      the agent runs, published the same way.
 
       A check run that cannot be created is a warning, never a failure, on the
       same contract as the comment. The Checks API needs a GitHub App
@@ -339,11 +356,12 @@ inputs:
       name, so this stays fixed no matter which agent runs: a mention can switch
       vendors mid-pull-request, and a name carrying the vendor would stop
       reporting under the name that was required. The agent that ran is named in
-      the check's own output instead.
+      the check's own output instead (a custom vendor is named by its `agent`
+      value).
 
-      Two reviews in one workflow must set two different names. `POST` creates
-      one check run per name per commit, so a shared name would have the second
-      job adopt the first's run and both would write over each other.
+      Two reviews in one workflow must set two different names, or both post a
+      check run under one name and the required check reports whichever finished
+      last.
     required: false
     default: 'TEA Test Review'
   github-token:
@@ -365,14 +383,20 @@ outputs:
     description: 'Gating quality score out of 100. Empty on a skipped review.'
     value: ${{ steps.review.outputs.quality-score }}
   full-quality-score:
-    description: 'Effective score across all findings. Empty on a skipped review.'
+    description: |
+      Kept for existing workflows; it now equals quality-score. In 'pr' review
+      mode the verdict carries only the pull request's findings, and in
+      'full-file' mode every finding gates. Empty on a skipped review.
     value: ${{ steps.review.outputs.full-quality-score }}
   raw-quality-score:
-    description: 'Uncapped deduction score across all findings. Empty on a skipped review.'
+    description: 'Uncapped deduction score of the gating findings. Empty on a skipped review.'
     value: ${{ steps.review.outputs.raw-quality-score }}
   gate-on:
     description: "Effective gate mode: 'introduced' or 'all'. Empty on a skipped review."
     value: ${{ steps.review.outputs.gate-on }}
+  review-mode:
+    description: "How the review was scoped: 'pr' (what the pull request introduced or worsened) or 'full-file' (every line of every reviewed file). Empty on a skipped review."
+    value: ${{ steps.review.outputs.review-mode }}
   critical:
     description: 'Gating Critical violation count.'
     value: ${{ steps.review.outputs.critical }}
@@ -392,7 +416,7 @@ outputs:
     description: "'true' when there were no changed test files to review. A skip and a pass both exit 0, so this is the only way to tell them apart."
     value: ${{ steps.review.outputs.skipped }}
   report-path:
-    description: 'Workspace-relative path of the markdown report, also uploaded as the tea-test-review-<job> artifact.'
+    description: 'Workspace-relative path of the markdown report, also uploaded as the tea-test-review-<job>-<agent> artifact.'
     value: ${{ steps.review.outputs.report-path }}
   json-path:
     description: 'Workspace-relative path of the verdict JSON.'
@@ -438,11 +462,12 @@ runs:
         persist-credentials: false
         clean: false
 
-    # Codex uses bubblewrap on Linux. GitHub-hosted Ubuntu 24.04 restricts the
+    # Codex uses bubblewrap on Linux. A `@codex` mention can switch to it from
+    # another agent, so the step also runs when the prompt names it. GitHub-hosted Ubuntu 24.04 restricts the
     # user namespace bubblewrap needs and otherwise fails every command with
     # `loopback: Failed RTM_NEWADDR`.
     - name: Enable Linux user namespaces for Codex
-      if: ${{ inputs.agent == 'codex' && runner.os == 'Linux' && runner.environment == 'github-hosted' }}
+      if: ${{ (inputs.agent == 'codex' || contains(inputs.prompt, '@codex')) && runner.os == 'Linux' && runner.environment == 'github-hosted' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -510,7 +535,7 @@ runs:
       if: always() && inputs.upload-report == 'true'
       uses: actions/upload-artifact@v4
       with:
-        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent }}
+        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent-tag }}
         path: |
           ${{ inputs.report-path }}
           ${{ inputs.json-path }}
