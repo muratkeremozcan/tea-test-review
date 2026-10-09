@@ -54,8 +54,8 @@ jobs:
       - name: Run unit tests
         run: node --test tests/*.test.js
 
-      # This exercises the composite action, npm pack and install, real CLI
-      # invocation, report parsing, and output mapping without paying for an
+      # This exercises the composite action, the global install of the CLI and
+      # agent, the real CLI invocation and its argv, and output mapping without paying for an
       # agent call. The placeholder credential is never sent anywhere because
       # the final CLI argument selects the no-agent prompt-generation mode.
       - name: Run deterministic consumer smoke

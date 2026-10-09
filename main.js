@@ -58,6 +58,12 @@ const notice = (msg) => log(`::notice::${msg}`);
 
 const TEA_PACKAGE = 'bmad-method-test-architecture-enterprise';
 
+/**
+ * Where the CLI is installed from when tea-version is empty. action.yml declares
+ * the same value and a test pins the two together.
+ */
+const DEFAULT_TEA_SOURCE = 'latest';
+
 /** The CLI's exit codes, which this action passes through unchanged. */
 const EXIT_MEANING = {
   0: 'review passed, was skipped, or a verdict failure was waived',
@@ -116,6 +122,18 @@ function resolveBaseRef(raw, env = process.env) {
   if (explicit !== '') return explicit;
   const base = String(env.GITHUB_BASE_REF || '').trim();
   return base ? `origin/${base}` : '';
+}
+
+/**
+ * The argument `npm install` takes for a tea-version value. A tarball URL, a
+ * `file:` spec or a path to a tarball is used as given; anything else is an npm
+ * version or dist-tag of the TeA package. The one place that knows where the CLI
+ * comes from, so moving the default source is a change to this function.
+ */
+function teaInstallSource(source) {
+  const value = String(source == null ? '' : source).trim() || DEFAULT_TEA_SOURCE;
+  const isTarball = /^(https?|file):/i.test(value) || /^(\.{0,2}\/|~\/)/.test(value) || /\.(tgz|tar\.gz)$/i.test(value);
+  return isTarball ? value : `${TEA_PACKAGE}@${value}`;
 }
 
 /** '' means "leave the CLI's own resolution alone", which is not the same as false. */
@@ -289,7 +307,8 @@ function buildCliArgs(opts) {
   if (opts.agentCommand !== opts.cliAgent) args.push('--agent-cmd', opts.agentCommand);
   valued([
     ['--env-pass', opts.envPass],
-    ['--model', opts.model],
+    // The CLI rejects --model with --agent none, which runs no agent.
+    ['--model', !opts.dryRun && opts.model],
   ]);
   for (const arg of opts.agentArgs || []) args.push(`--agent-arg=${arg}`);
   valued([
@@ -312,10 +331,10 @@ function buildCliArgs(opts) {
 /**
  * Verdict fields to step outputs; a skipped review has nulls, not zeros.
  * `full-quality-score` and `raw-quality-score` read `qualityScore` and
- * `rawQualityScore`. In the default `pr` review mode those describe the pull
- * request's own findings, the ones the gate counts, so they equal the gating
- * values; in `full-file` mode they cover the whole review set (`review-mode`
- * says which). The verdict no longer carries a recommendation over all findings
+ * `rawQualityScore`. In `pr` review mode the verdict carries only the pull
+ * request's own findings, and in `full-file` mode every finding gates, so these
+ * equal the gating values; the outputs keep their names for existing workflows.
+ * The verdict no longer carries a recommendation over all findings
  * (`allFindingsRecommendation`), and no output ever exposed it.
  */
 function outputsFromVerdict(verdict) {
@@ -328,7 +347,7 @@ function outputsFromVerdict(verdict) {
     'quality-score': skipped || gatingQualityScore == null ? '' : String(gatingQualityScore),
     'full-quality-score': skipped || v.qualityScore == null ? '' : String(v.qualityScore),
     'raw-quality-score': skipped || v.rawQualityScore == null ? '' : String(v.rawQualityScore),
-    'gate-on': skipped ? '' : String(v.gateOn ?? v.reviewProvenance?.gateMode ?? ''),
+    'gate-on': skipped ? '' : String(v.gateOn ?? ''),
     'review-mode': skipped || v.reviewMode == null ? '' : String(v.reviewMode),
     critical: String(counts.critical ?? 0),
     high: String(counts.high ?? 0),
@@ -366,12 +385,22 @@ function runCommand(command, args, options = {}) {
     if (result.error.code === 'ENOENT') throw new Error(`${command} not found on PATH`);
     throw new Error(`${command} failed: ${result.error.message}`);
   }
-  return result.status ?? 1;
+  // A command killed by a signal has no exit status: that is a gate that did not run (3), never a verdict (1).
+  if (result.status == null) {
+    warn(`${command} was terminated by ${result.signal || 'a signal'}.`);
+    return 3;
+  }
+  return result.status;
 }
 
 function runCommandChecked(command, args, options = {}) {
   const status = runCommand(command, args, options);
   if (status !== 0) throw new Error(`${command} ${args.join(' ')} exited with code ${status}`);
+}
+
+/** Install the CLI from its source (see teaInstallSource) and the agent CLI, globally, in one npm call so the CLI resolves once. */
+function installCli(source, agentSpec, runner = runCommandChecked) {
+  runner(binaryName('npm'), ['install', '--global', teaInstallSource(source), agentSpec]);
 }
 
 /**
@@ -409,7 +438,7 @@ function agentLogin(agent, credential) {
  */
 function assertCliIsCurrent(teaVersion, runner = spawnSync) {
   const help = runner(binaryName('tea-test-review'), ['--help'], { encoding: 'utf8' });
-  const spec = `${TEA_PACKAGE}@${teaVersion}`;
+  const spec = teaInstallSource(teaVersion);
   if (help.error) {
     throw new Error(
       `tea-test-review could not start after installing ${spec} (${help.error.message}). ` +
@@ -419,7 +448,7 @@ function assertCliIsCurrent(teaVersion, runner = spawnSync) {
   if (!/--github\b/.test(String(help.stdout))) {
     throw new Error(
       `${spec} predates the --github publisher this action drives, so its CLI cannot post the comment or the check run. ` +
-        'Set tea-version to a release whose `tea-test-review --help` lists --github (`next` until the stable release ships it).'
+        'Set tea-version to a release whose `tea-test-review --help` lists --github.'
     );
   }
 }
@@ -461,13 +490,13 @@ function readJsonIfPresent(file) {
  */
 function runReviewCli(opts, args, commandRunner = runCommand) {
   for (const artifact of [opts.reportPath, opts.jsonPath]) {
-    fs.rmSync(path.join(opts.workspace, artifact), { force: true });
+    fs.rmSync(path.resolve(opts.workspace, artifact), { force: true });
   }
   const status = commandRunner(binaryName('tea-test-review'), args, {
     cwd: opts.workspace,
     env: childEnv(opts.credential, process.env, os.userInfo(), { token: opts.token, apiUrl: opts.apiUrl }),
   });
-  return { status, verdict: readJsonIfPresent(path.join(opts.workspace, opts.jsonPath)) };
+  return { status, verdict: readJsonIfPresent(path.resolve(opts.workspace, opts.jsonPath)) };
 }
 
 // ─── trigger resolution ───────────────────────────────────────────────────────
@@ -548,6 +577,11 @@ function resolveTrigger({ mode, mentions, agentInput, payload, eventName }) {
       : skip('mode is manual: pull_request events do not trigger the review (comment a mention on the PR instead)');
   }
 
+  // Runs on the base branch, where the checkout holds no pull request code: the diff would be empty and the review a neutral skip.
+  if (eventName === 'pull_request_target') {
+    return skip('pull_request_target runs on the base branch, so there is no pull request code to review (use pull_request, or comment a mention)');
+  }
+
   if (eventName !== 'issue_comment') {
     return mode === 'auto'
       ? { proceed: true, via: eventName || 'event', agent: agentInput, agentSwitched: false, focus: '' }
@@ -581,9 +615,10 @@ function resolveTrigger({ mode, mentions, agentInput, payload, eventName }) {
 function buildOptions(env = process.env, { agentOverride = '', agentSwitched = false, focus = '' } = {}) {
   const agent = resolveAgent({
     agent: agentOverride || getInput('agent', env),
-    agentPackage: getInput('agent-package', env),
-    agentCommand: getInput('agent-command', env),
-    agentKeyEnv: getInput('agent-key-env', env),
+    // Like model and agent-args, these describe the configured agent: after a mention switch they would install and run the wrong vendor.
+    agentPackage: agentSwitched ? '' : getInput('agent-package', env),
+    agentCommand: agentSwitched ? '' : getInput('agent-command', env),
+    agentKeyEnv: agentSwitched ? '' : getInput('agent-key-env', env),
     agentVersions: {
       claude: getInput('claude-code-version', env) || 'latest',
       codex: getInput('codex-version', env) || 'latest',
@@ -604,8 +639,7 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
   return {
     agent,
     credential,
-    // `next` until the stable TeA cut; action.yml says why.
-    teaVersion: getInput('tea-version', env) || 'next',
+    teaVersion: getInput('tea-version', env) || DEFAULT_TEA_SOURCE,
     baseRef: resolveBaseRef(getInput('base-ref', env), env),
     reportPath: getInput('report-path', env) || 'test-review.md',
     jsonPath: getInput('json-path', env) || 'test-review.json',
@@ -629,7 +663,8 @@ function buildOptions(env = process.env, { agentOverride = '', agentSwitched = f
     comment: getBooleanInput('comment', env),
     checkRun: getBooleanInput('check-run', env),
     checkRunName: getInput('check-run-name', env) || 'TEA Test Review',
-    uploadReport: getBooleanInput('upload-report', env),
+    // The upload step in action.yml tests `== 'true'`; 'yes' or '1' would name an artifact that is never uploaded.
+    uploadReport: getInput('upload-report', env).toLowerCase() === 'true',
     token: getInput('github-token', env),
     apiUrl: getInput('github-api-url', env) || 'https://api.github.com',
     workspace: env.GITHUB_WORKSPACE || process.cwd(),
@@ -690,7 +725,7 @@ async function run(env = process.env) {
   setOutput('agent', opts.agent.key);
 
   const { plan, args } = planCliArgs(opts, resolvePrNumber(payload, env), env);
-  log(`TEA Test Review: ${TEA_PACKAGE}@${opts.teaVersion}, agent ${opts.agent.key} (${opts.agent.packageSpec})`);
+  log(`TEA Test Review: ${teaInstallSource(opts.teaVersion)}, agent ${opts.agent.key} (${opts.agent.packageSpec})`);
   log(`  base ref: ${opts.baseRef || '(resolved by the CLI)'}, credential: ${opts.credential.name}`);
   if (trigger.via === 'mention') {
     log(`  triggered by a "${trigger.mention}" comment${trigger.focus ? `, focus: ${trigger.focus}` : ''}`);
@@ -710,7 +745,7 @@ async function run(env = process.env) {
   }
 
   // The CLI carries its own review skill: one install, one version, out of the pull request's reach.
-  runCommandChecked(binaryName('npm'), ['install', '--global', `${TEA_PACKAGE}@${opts.teaVersion}`, opts.agent.packageSpec]);
+  installCli(opts.teaVersion, opts.agent.packageSpec);
   assertCliIsCurrent(opts.teaVersion);
   agentLogin(opts.agent, opts.credential);
 
@@ -746,7 +781,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  AGENTS, CLI_RETRIES, MENTION_TRUSTED_ASSOCIATIONS, MAX_FOCUS_LENGTH,
+  AGENTS, CLI_RETRIES, DEFAULT_TEA_SOURCE, teaInstallSource, installCli, MENTION_TRUSTED_ASSOCIATIONS, MAX_FOCUS_LENGTH,
   getInput, getBooleanInput, setOutput, binaryName, resolveBaseRef,
   parseMode, parseMentions, matchMention, extractFocus, agentForMention, resolveTrigger,
   parseTriState, parsePactMcp, parseExtraArgs, resolveAgent, resolveCredential, agentLogin,

@@ -44,22 +44,6 @@ function declaredInputs() {
   return [...section.matchAll(/^  ([a-z-]+):$/gm)].map((m) => m[1]);
 }
 
-/** Run fn with stdout captured, restoring the real one even when fn throws. */
-async function captureStdout(fn) {
-  const original = process.stdout.write;
-  let logged = '';
-  process.stdout.write = (msg) => {
-    logged += msg;
-    return true;
-  };
-  try {
-    await fn();
-  } finally {
-    process.stdout.write = original;
-  }
-  return logged;
-}
-
 describe('getInput', () => {
   test('uppercases the name and preserves dashes, matching @actions/core', () => {
     const env = { 'INPUT_MIN-SCORE': ' 80 ', INPUT_AGENT: 'claude' };
@@ -205,9 +189,9 @@ describe('resolveTrigger', () => {
   });
 
   test('issue_comment skips on a plain issue, a bot comment, and a mention-less comment', () => {
-    assert.strictEqual(
-      action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: { issue: { number: 7 }, comment: { body: '@claude' } }, eventName: 'issue_comment' }).proceed,
-      false
+    assert.deepStrictEqual(
+      action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: { issue: { number: 7 }, comment: { body: '@claude', author_association: 'MEMBER', user: { type: 'User' } } }, eventName: 'issue_comment' }),
+      { proceed: false, reason: 'the comment is not on a pull request' }
     );
     assert.strictEqual(
       action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: commentOnPr('@claude', 'MEMBER', 'Bot'), eventName: 'issue_comment' }).proceed,
@@ -217,6 +201,24 @@ describe('resolveTrigger', () => {
       action.resolveTrigger({ mode: 'auto', mentions, agentInput: 'claude', payload: commentOnPr('lgtm'), eventName: 'issue_comment' }).proceed,
       false
     );
+  });
+
+  test('pull_request_target is skipped: it runs on the base branch, so there is nothing to review', () => {
+    const result = action.resolveTrigger({ mode: 'auto', mentions: [], agentInput: 'claude', payload: {}, eventName: 'pull_request_target' });
+    assert.strictEqual(result.proceed, false);
+    assert.match(result.reason, /pull_request_target/);
+  });
+
+  test('a mention of the configured vendor is not a switch, so its model and agent-args stand', () => {
+    const result = action.resolveTrigger({
+      mode: 'auto',
+      mentions: ['@claude', '@codex'],
+      agentInput: 'claude',
+      payload: { issue: { number: 7, pull_request: {} }, comment: { body: '@claude look', author_association: 'MEMBER', user: { type: 'User' } } },
+      eventName: 'issue_comment',
+    });
+    assert.strictEqual(result.agent, 'claude');
+    assert.strictEqual(result.agentSwitched, false);
   });
 
   test('a mention from an untrusted association skips: the gate is the security model', () => {
@@ -286,7 +288,7 @@ describe('buildOptions trigger overrides', () => {
     assert.strictEqual(opts.agent.key, 'codex');
   });
 
-  test('a @codex mention switches the resolved agent, the same value the artifact name and comment tag read', () => {
+  test('a @codex mention switches the resolved agent, the same value the artifact name reads', () => {
     const trigger = action.resolveTrigger({
       mode: 'auto',
       mentions: ['@claude', '@codex'],
@@ -311,6 +313,15 @@ describe('buildOptions trigger overrides', () => {
     );
     assert.strictEqual(opts.cli.model, '');
     assert.deepStrictEqual(opts.cli.agentArgs, []);
+  });
+
+  test('a vendor switch also resets the vendor-describing inputs, so the switched agent installs and runs as itself', () => {
+    const opts = action.buildOptions(
+      { ...baseEnv, 'INPUT_OPENAI-API-KEY': 'sk-oai', 'INPUT_AGENT-PACKAGE': '@anthropic-ai/claude-code@2.0.0', 'INPUT_AGENT-COMMAND': 'claude-beta' },
+      { agentOverride: 'codex', agentSwitched: true }
+    );
+    assert.strictEqual(opts.agent.packageSpec, '@openai/codex@latest');
+    assert.strictEqual(opts.agent.command, 'codex');
   });
 
   test('without a switch the configured model and agent-args stand', () => {
@@ -840,6 +851,11 @@ describe('buildCliArgs', () => {
     assert.ok(!action.buildCliArgs({ ...base, model: '' }).includes('--model'));
   });
 
+  test('a dry run drops --model, which the CLI rejects with --agent none', () => {
+    assert.ok(!action.buildCliArgs({ ...base, model: 'opus', dryRun: true }).includes('--model'));
+    assert.ok(action.buildCliArgs({ ...base, model: 'opus', dryRun: false }).includes('--model'));
+  });
+
   test('focus becomes --focus', () => {
     const args = action.buildCliArgs({ ...base, focus: 'look at auth' });
     assert.strictEqual(args[args.indexOf('--focus') + 1], 'look at auth');
@@ -906,6 +922,40 @@ describe('planGithub', () => {
     const files = { ...inputs, comment: false, checkRun: false, extraArgs: ['--files', 'a.spec.ts'] };
     assert.strictEqual(action.planGithub(files, 7).pr, null);
     assert.strictEqual(action.planGithub({ ...files, comment: true }, 7).pr, 7);
+  });
+});
+
+describe('teaInstallSource and installCli', () => {
+  const PKG = 'bmad-method-test-architecture-enterprise';
+
+  test('a version or dist-tag is an npm spec of the TeA package', () => {
+    assert.strictEqual(action.teaInstallSource('1.28.0'), `${PKG}@1.28.0`);
+    assert.strictEqual(action.teaInstallSource('next'), `${PKG}@next`);
+  });
+
+  test('empty falls back to the default source', () => {
+    assert.strictEqual(action.teaInstallSource(''), `${PKG}@${action.DEFAULT_TEA_SOURCE}`);
+    assert.strictEqual(action.teaInstallSource(undefined), `${PKG}@${action.DEFAULT_TEA_SOURCE}`);
+  });
+
+  test('a tarball URL, a file: spec and a tarball path are used as given', () => {
+    for (const source of [
+      'https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise/releases/download/v1.28.0/tea-1.28.0.tgz',
+      'file:../tea.tgz',
+      './tea.tgz',
+      '/tmp/pack/tea-1.28.0.tgz',
+      'tea-1.28.0.tgz',
+    ]) {
+      assert.strictEqual(action.teaInstallSource(source), source);
+    }
+  });
+
+  test('installCli installs the CLI source and the agent in one global npm call', () => {
+    const calls = [];
+    action.installCli('https://example.com/tea.tgz', '@anthropic-ai/claude-code@2.1.220', (command, args) => calls.push([command, args]));
+    assert.deepStrictEqual(calls, [
+      [action.binaryName('npm'), ['install', '--global', 'https://example.com/tea.tgz', '@anthropic-ai/claude-code@2.1.220']],
+    ]);
   });
 });
 
@@ -1003,13 +1053,9 @@ describe('action.yml defaults', () => {
     assert.strictEqual(buildWith({}).teaVersion, declaredDefault('tea-version'));
   });
 
-  test('tea-version defaults to the floating dist-tag next until the stable TeA cut, and says why', () => {
-    // `latest` stays on the previous release until the cut, and that release
-    // has no --github, --pr or --retries. A pinned number would not float, so
-    // the default is the dist-tag. Kerem flips it back to `latest` with the cut.
-    assert.strictEqual(declaredDefault('tea-version'), 'next');
-    assert.match(ACTION_YML, /`latest` stays on the previous release[\s\S]*?until the stable cut/);
-    assert.match(fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8'), /defaults to `next`/);
+  test('tea-version falls back to the one DEFAULT_TEA_SOURCE that action.yml also declares', () => {
+    assert.strictEqual(action.DEFAULT_TEA_SOURCE, declaredDefault('tea-version'));
+    assert.strictEqual(buildWith({ 'INPUT_TEA-VERSION': '' }).teaVersion, action.DEFAULT_TEA_SOURCE);
   });
 
   test('claude-code-version floats to latest', () => {
@@ -1142,6 +1188,8 @@ describe('action.yml defaults', () => {
     assert.strictEqual(declaredDefault('upload-report'), 'true');
     assert.strictEqual(buildWith({}).uploadReport, false);
     assert.strictEqual(buildWith({ 'INPUT_UPLOAD-REPORT': 'true' }).uploadReport, true);
+    // The upload step tests == 'true', so 'yes' would name an artifact that is never uploaded.
+    assert.strictEqual(buildWith({ 'INPUT_UPLOAD-REPORT': 'yes' }).uploadReport, false);
   });
 
   test('runs as a composite action, because a JavaScript action cannot have an upload step', () => {
@@ -1161,8 +1209,10 @@ describe('action.yml defaults', () => {
     assert.ok(setupIndex > 0 && setupIndex < reviewIndex, 'sandbox prerequisite must run before the review');
     assert.match(
       ACTION_YML,
-      /if: \$\{\{ inputs\.agent == 'codex' && runner\.os == 'Linux' && runner\.environment == 'github-hosted' \}\}/,
+      /if: \$\{\{ \(inputs\.agent == 'codex' \|\| contains\(inputs\.prompt, '@codex'\)\) && runner\.os == 'Linux' && runner\.environment == 'github-hosted' \}\}/,
     );
+    // A `@codex` mention can switch to codex from another configured agent, so
+    // the step must not depend on inputs.agent alone.
     assert.match(ACTION_YML, /sudo sysctl -w kernel\.unprivileged_userns_clone=1/);
     assert.match(ACTION_YML, /sudo sysctl -w kernel\.apparmor_restrict_unprivileged_userns=0/);
   });
@@ -1203,8 +1253,6 @@ describe('action.yml defaults', () => {
     // own output, the same source the --artifact-name flag uses, or the two diverge
     // the moment a mention switches the agent.
     assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent \}\}/);
-    const source = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-    assert.match(source, /tea-test-review-\$\{env\.GITHUB_JOB\}-\$\{opts\.agent\.key\}/);
   });
 });
 
@@ -1239,22 +1287,13 @@ describe('outputsFromVerdict', () => {
   });
 
   test('the score outputs keep their names and read qualityScore and rawQualityScore from the current verdict', () => {
-    // TeA #388 removed allFindingsRecommendation and scoped qualityScore and
-    // violations to the pull request in pr review mode. The outputs that read
-    // the surviving fields keep working; none ever read the removed one.
-    const verdict = { ...passing, gatingQualityScore: 80, qualityScore: 80, rawQualityScore: 85 };
-    const outputs = action.outputsFromVerdict(verdict);
+    // TeA #388 removed allFindingsRecommendation. The outputs that read the
+    // surviving fields keep working; none ever read the removed one.
+    const outputs = action.outputsFromVerdict({ ...passing, gatingQualityScore: 80, qualityScore: 80, rawQualityScore: 85 });
     assert.strictEqual(outputs['quality-score'], '80');
     assert.strictEqual(outputs['full-quality-score'], '80');
     assert.strictEqual(outputs['raw-quality-score'], '85');
     assert.ok(!('all-findings-recommendation' in outputs));
-  });
-
-  test('a full-file verdict reports its whole-set score under full-quality-score', () => {
-    const outputs = action.outputsFromVerdict({ ...passing, reviewMode: 'full-file', gateOn: 'all', gatingQualityScore: 96, qualityScore: 70 });
-    assert.strictEqual(outputs['review-mode'], 'full-file');
-    assert.strictEqual(outputs['quality-score'], '96');
-    assert.strictEqual(outputs['full-quality-score'], '70');
   });
 
   test('a skipped review reports no score and no recommendation', () => {
@@ -1348,6 +1387,16 @@ describe('addReaction', () => {
     assert.deepStrictEqual(calls[0].body, { content: 'eyes' });
   });
 
+  test('a trailing slash on the API URL does not double up', async () => {
+    const urls = [];
+    global.fetch = async (url) => {
+      urls.push(url);
+      return { ok: true, status: 200, text: async () => '' };
+    };
+    await action.addReaction({ ...ctx, apiUrl: 'https://ghe.example/api/v3/' }, 9);
+    assert.strictEqual(urls[0], 'https://ghe.example/api/v3/repos/o/r/issues/comments/9/reactions');
+  });
+
   test('swallows a failure as a warning: cosmetic, must never throw', async () => {
     global.fetch = async () => ({ ok: false, status: 403, json: async () => null, text: async () => 'nope' });
     const originalWrite = process.stdout.write;
@@ -1428,7 +1477,7 @@ describe('an existing workflow runs unchanged', { skip: process.platform === 'wi
       fs.chmodSync(file, 0o755);
     };
     const record = (fields) => `fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ bin: path.basename(process.argv[1]), argv: process.argv.slice(2), ${fields} }) + '\\n');`;
-    script('npm', record(''));
+    script('npm', `${record('')}\nprocess.exit(Number(process.env.FAKE_NPM_EXIT || 0));`);
     script(
       'codex',
       `let stdin = ''; try { stdin = fs.readFileSync(0, 'utf8'); } catch {}\n${record('stdin')}`
@@ -1443,6 +1492,7 @@ if (process.env.FAKE_VERDICT) {
   fs.mkdirSync(path.dirname(json), { recursive: true });
   fs.writeFileSync(json, process.env.FAKE_VERDICT);
 }
+if (process.env.FAKE_SIGNAL) process.kill(process.pid, process.env.FAKE_SIGNAL);
 process.exit(Number(process.env.FAKE_EXIT || 0));`
     );
   }
@@ -1663,12 +1713,125 @@ process.exit(Number(process.env.FAKE_EXIT || 0));`
     }
   });
 
+  test('a custom vendor runs as claude under its own executable, with its credential allowlisted', async () => {
+    const inputs = {
+      ...EVERY_INPUT,
+      agent: 'gemini',
+      'anthropic-api-key': '',
+      'agent-package': '@google/gemini-cli@0.5.0',
+      'agent-command': 'gemini',
+      'agent-key-env': 'GEMINI_API_KEY',
+      'agent-api-key': 'gem-test',
+      model: '',
+      'agent-args': '',
+    };
+    const run = await runAction({ inputs });
+    try {
+      assert.strictEqual(run.status, 0, run.stdout + run.stderr);
+      assert.deepStrictEqual(run.calls[0].argv, ['install', '--global', 'bmad-method-test-architecture-enterprise@1.28.0', '@google/gemini-cli@0.5.0']);
+      const argv = cliCall(run).argv;
+      assert.deepStrictEqual(argv.slice(0, 2), ['--agent', 'claude']);
+      assert.strictEqual(argv[argv.indexOf('--agent-cmd') + 1], 'gemini');
+      assert.strictEqual(argv[argv.indexOf('--env-pass') + 1], 'GEMINI_API_KEY');
+      assert.strictEqual(argv[argv.indexOf('--artifact-name') + 1], 'tea-test-review-review-gemini');
+      assert.match(run.stdout, /::warning::Agent "gemini" is not a built-in vendor/);
+      assert.strictEqual(run.outputs.agent, 'gemini');
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('tea-version also takes a tarball URL, installed as given', async () => {
+    const url = 'https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise/releases/download/v1.28.0/tea-1.28.0.tgz';
+    const run = await runAction({ inputs: { ...EVERY_INPUT, 'tea-version': url } });
+    try {
+      assert.deepStrictEqual(run.calls[0].argv.slice(0, 3), ['install', '--global', url]);
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a failed install stops the run before the CLI and exits 2', async () => {
+    const run = await runAction({ extraEnv: { FAKE_NPM_EXIT: '1' } });
+    try {
+      assert.strictEqual(run.status, 2);
+      assert.strictEqual(cliCall(run), undefined);
+      assert.match(run.stdout, /::error::.*npm.*exited with code 1/);
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('an event that does not trigger the review is a clean skip: exit 0, skipped=true, nothing installed', async () => {
+    const run = await runAction({ inputs: { ...EVERY_INPUT, mode: 'manual' } });
+    try {
+      assert.strictEqual(run.status, 0);
+      assert.deepStrictEqual(run.outputs, { skipped: 'true' });
+      assert.deepStrictEqual(run.calls, []);
+      assert.match(run.stdout, /::notice::TEA Test Review not triggered/);
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a CLI killed by a signal is a broken gate, not a pass and not a verdict', async () => {
+    const run = await runAction({ verdict: null, extraEnv: { FAKE_SIGNAL: 'SIGKILL' } });
+    try {
+      assert.strictEqual(run.status, 3);
+      assert.match(run.stdout, /terminated by SIGKILL/);
+      assert.match(run.stdout, /did not produce a verdict/);
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('neither the GitHub token nor the agent credential appears in the log', async () => {
+    const run = await runAction();
+    try {
+      assert.ok(!(run.stdout + run.stderr).includes('ghs_test_token'));
+      assert.ok(!(run.stdout + run.stderr).includes('sk-ant-test'));
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('a waived verdict failure passes with a notice naming the reason', async () => {
+    const run = await runAction({ verdict: { ...VERDICT, waived: true, waiveReason: 'FP-1' } });
+    try {
+      assert.strictEqual(run.status, 0);
+      assert.match(run.stdout, /::notice::Verdict failure waived: FP-1/);
+    } finally {
+      run.cleanup();
+    }
+  });
+
+  test('an absolute json-path is read where the CLI wrote it', async () => {
+    const abs = path.join(os.tmpdir(), `tea-wiring-abs-${process.pid}.json`);
+    const run = await runAction({ inputs: { ...EVERY_INPUT, 'json-path': abs } });
+    try {
+      assert.strictEqual(run.outputs.recommendation, 'Approve with Comments');
+    } finally {
+      fs.rmSync(abs, { force: true });
+      run.cleanup();
+    }
+  });
+
+  test('upload-report other than true names no artifact, because the upload step would skip', async () => {
+    const run = await runAction({ inputs: { ...EVERY_INPUT, 'upload-report': 'yes' } });
+    try {
+      assert.ok(!cliCall(run).argv.includes('--artifact-name'));
+    } finally {
+      run.cleanup();
+    }
+  });
+
   test('a dry run through extra-args reviews nothing and publishes nothing', async () => {
     const run = await runAction({ inputs: { ...EVERY_INPUT, 'extra-args': '--agent none' }, verdict: { promptOnly: true, files: ['tests/a.spec.ts'] } });
     try {
       assert.strictEqual(run.status, 0, run.stdout);
       const argv = cliCall(run).argv;
       assert.ok(!argv.includes('--github'));
+      assert.ok(!argv.includes('--model'), 'the CLI rejects --model with --agent none');
       assert.deepStrictEqual(argv.slice(-2), ['--agent', 'none']);
       assert.match(run.stdout, /::notice::extra-args select --agent none/);
     } finally {

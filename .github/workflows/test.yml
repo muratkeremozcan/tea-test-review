@@ -111,7 +111,7 @@ jobs:
       # the dry run published nothing. Every later push to this PR runs the CLI's
       # upsert against it, whose race and legacy-marker rules the CLI's own suite
       # tests.
-      - name: Assert the second run updated rather than duplicated
+      - name: Assert exactly one review comment
         if: always() && steps.creds.outputs.present == 'true' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}

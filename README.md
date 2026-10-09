@@ -35,24 +35,27 @@ Add no checkout step: the action checks out the code itself, full history at
 the PR's merge commit. GitHub-hosted runners already have Node 22+, so no
 `setup-node` step either.
 
-### `tea-version` defaults to `next`
+### `tea-version` and where the CLI comes from
 
-The action drives CLI features that TeA publishes on the npm `next` dist-tag
-first: `--github` (the comment and the check run), `--pr` (the base branch
-lookup), `--retries`, and the packaged skill. `latest` stays on the previous
-release until the stable TeA cut, and that release has none of them, so the
-default `tea-version` is `next`, a floating dist-tag. It moves back to `latest`
-with the stable cut. The action runs `tea-test-review --help` after installing
-and fails with the version to change when `--github` is missing, instead of an
-unknown-option error mid-run.
+`tea-version` takes a version or dist-tag of
+`bmad-method-test-architecture-enterprise`, a tarball URL, or a path to a
+tarball (an `npm pack` of the package). The action installs it globally with
+the agent CLI in one step; the CLI carries its own review skill, so the skill
+and the CLI are always one version.
 
-`next` follows whatever it resolves to on the day a pull request lands. Pin an
-exact version when the verdict has to be reproducible, once a release carrying
-those features is published:
+The action drives CLI features that older releases do not have: `--github` (the
+comment and the check run), `--pr` (the base branch lookup), `--retries`, and
+the packaged skill. After installing it runs `tea-test-review --help` and stops
+with the version to change when `--github` is missing, instead of an
+unknown-option error mid-run. A workflow that pins `tea-version` to a release
+without those features now fails there with exit 2; move the pin to a release
+whose CLI lists `--github`.
+
+Pin an exact version or a tarball URL when the verdict has to be reproducible:
 
 ```yaml
 with:
-  tea-version: "<a release whose CLI lists --github>"
+  tea-version: "<a release or tarball whose CLI lists --github>"
 ```
 
 ## Proven configurations
@@ -172,7 +175,7 @@ model generation. The slug that ran is recorded in the verdict JSON next to
 
 ### Dual reviews (Codex & Claude)
 
-Run multiple review steps in the same workflow. Comments (`<!-- tea-test-review:<agent> -->`) and report artifacts (`tea-test-review-<job>-<agent>`) automatically tag by `agent` key, so each agent posts its own comment without collision:
+Run multiple review steps in the same workflow. For `claude` and `codex`, comments (`<!-- tea-test-review:<agent> -->`) and report artifacts (`tea-test-review-<job>-<agent>`) tag by the `agent` key, so each agent posts its own comment without collision:
 
 ```yaml
 steps:
@@ -197,10 +200,12 @@ steps:
       check-run-name: TEA Test Review (claude)
 ```
 
-Every comment and artifact tags by the resolved `agent` key, so that part is
-automatic. The check run is matched by name, so two reviews on one pull
-request need two different `check-run-name` values, or the second adopts the
-first's check run. Running the same agent twice in
+That tagging is automatic. A custom vendor runs as `--agent claude`, so its
+comment marker and check text carry the `claude` tag and collide with a claude
+review on the same pull request; its artifact still tags by the `agent` input.
+The check run is matched by name, so two reviews on one pull request need two
+different `check-run-name` values, or both post a check run under one name and
+the required check reports whichever finished last. Running the same agent twice in
 one workflow (e.g. two `codex` steps with different models) is not
 disambiguated — the second step's comment and artifact overwrite the first's.
 
@@ -254,8 +259,7 @@ jobs:
   parse for the new vendor. `pull_request` runs always use the `agent` input.
 - The focus text reaches the reviewer capped at 1000 characters; it may raise
   scrutiny on what it names and can never waive a finding. The report quotes
-  it as a `**Focus**:` line. Requires a tea-version whose CLI understands
-  `--focus`. A PR with no changed test files still skips, but the skip
+  it as a `**Focus**:` line. A PR with no changed test files still skips, but the skip
   comment quotes what you asked for and says what changed instead.
 - Only a comment from an OWNER, MEMBER or COLLABORATOR (never a bot) on a
   pull request triggers the review, and the action enforces that itself. An
@@ -292,8 +296,10 @@ never costs you the review.
 |  `2` | Environment or configuration error. **No review happened**             |
 |  `3` | Agent or report-parse failure. **No review happened**                  |
 
-`2` and `3` mean no review happened; the log and the comment say so, and
-neither is ever reported as approved tests. The CLI retries exit `3` once
+`2` and `3` mean no review happened; the log says so, and so do the comment
+and check run whenever the CLI got far enough to publish them (a failure in the
+action before the CLI starts, such as the install, a missing credential or the
+agent login, publishes neither). Neither is ever reported as approved tests. The CLI retries exit `3` once
 (the action passes `--retries 1`; a fresh agent invocation, not a report
 re-parse) before giving up: a crashed agent process is often a one-off blip
 rather than a real problem with the diff. `1` and `2` are never retried; a
@@ -357,9 +363,10 @@ a `pull_request_target` workflow with strict controls.
 
 ## Artifacts
 
-`report-path` and `json-path` upload as the `tea-test-review-<job>` artifact
-on every run, including a failed verdict, so a report too large to inline
-survives the runner's deletion; the comment says which artifact holds it.
+`report-path` and `json-path` upload as the `tea-test-review-<job>-<agent>`
+artifact on every run, including a failed verdict. The comment carries only the
+verdict and up to three gating findings, so the artifact is where the full
+report lives; the comment names it.
 Opt out with `upload-report: 'false'`.
 
 ## Configuration
@@ -388,13 +395,13 @@ with a consequence you would not guess:
 
 ```yaml
 with:
-  extra-args: --waive "flaky suite, FP-1234" --waive-until 2026-09-30
+  extra-args: --waive "flaky suite, FP-1234" --waive-until 2030-01-01
 ```
 
 That covers `--files`, `--test-glob`, `--timeout-ms`, `--fail-on-skip`,
 `--waive`/`--waive-until`, `--isolate`/`--no-isolate`, `--env-pass` and
 `--retries`. `--agent none` makes a dry run that builds the prompt and reviews
-nothing; the CLI refuses to publish a review that never ran, so a dry run posts
+nothing (the `model` input is ignored for it); the CLI refuses to publish a review that never ran, so a dry run posts
 no comment and no check run. See
 the
 [full CLI flag reference](https://github.com/bmad-code-org/bmad-method-test-architecture-enterprise/blob/main/docs/reference/tea-test-review-cli.md).
@@ -416,12 +423,12 @@ the
 
 Every output keeps its name; the sources moved with the CLI's verdict.
 `full-quality-score` and `raw-quality-score` read the verdict's `qualityScore`
-and `rawQualityScore`. In the default `pr` review mode those describe the pull
-request's own findings, the same ones the gate counts, so `full-quality-score`
-equals `quality-score`: the verdict no longer scores pre-existing findings the
-pull request did not touch. In `full-file` mode (`gate-on: all`, or
-`--files`) they cover the whole review set, as before, and `review-mode` says
-which applies. The verdict also dropped `allFindingsRecommendation`, the
+and `rawQualityScore`. In `pr` review mode the verdict carries only the pull
+request's own findings, and in `full-file` mode (`gate-on: all`, or `--files`)
+every finding gates, so `full-quality-score` now equals `quality-score` and
+`raw-quality-score` is the gating raw score; `review-mode` says which mode ran.
+The verdict no longer scores pre-existing findings the pull request did not
+touch. The verdict also dropped `allFindingsRecommendation`, the
 recommendation over all findings; no output ever carried it, and neither does
 the comment now.
 
@@ -483,15 +490,16 @@ vendors get the login step above.
   `tea-version` to an exact release when you want to vet it once and bump it
   deliberately.
 - `claude-code-version` and `codex-version` default to `latest`, so callers
-  carry no bump; `tea-version` defaults to `next` until the stable TeA cut (see
-  above). Each takes an exact version when a run has to be reproducible or a
-  vendor release breaks it.
+  carry no bump; `tea-version` is described above. Each takes an exact version
+  when a run has to be reproducible or a vendor release breaks it.
 - The CLI upserts the comment on a hidden marker, so ten pushes update one
-  comment, and two agents on one pull request keep one comment each. The
+  comment, and two built-in agents on one pull request keep one comment each. The
   comment and the check run belong to the `github-token`'s account. A comment
   or check run that cannot be written is a warning and never changes the
-  verdict. An install failure before the CLI starts opens no check run; the
-  job's own failure is the signal.
+  verdict. A failure before the CLI starts (npm install, a missing credential,
+  agent login, a `tea-version` without `--github`) opens no check run and posts
+  no comment; the job's own failure is the signal, and a required check stays
+  Expected until a later run reports it.
 - The CLI prints a heartbeat every 15 seconds, streamed straight through, so
   a live job shows progress rather than looking hung. Give the job a
   `timeout-minutes` that accommodates a multi-minute review.
