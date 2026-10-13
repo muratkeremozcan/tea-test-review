@@ -1301,10 +1301,24 @@ describe('action.yml defaults', () => {
 
   test('the report upload runs even on a failing verdict, which is when the report matters most', () => {
     assert.match(ACTION_YML, /if: always\(\) && inputs\.upload-report == 'true'/);
-    assert.match(ACTION_YML, /uses: actions\/upload-artifact@v4/);
+    assert.match(ACTION_YML, /if: always\(\) && inputs\.upload-report == 'true' && steps\.review\.outputs\.json-path != ''/);
+    assert.match(ACTION_YML, /uses: actions\/upload-artifact@v7/);
+    // The markdown uploads un-zipped so the comment can link the file itself.
+    assert.strictEqual((ACTION_YML.match(/^\s+archive: false$/gm) || []).length, 2);
     // Two invocations in one job (a dry run, then a live review) share the
-    // artifact name, and v4 artifacts are immutable without this.
-    assert.match(ACTION_YML, /overwrite: true/);
+    // artifact name, and artifacts are immutable without this. v7 deletes by
+    // the name input, so it must equal the staged filename with archive: false.
+    assert.strictEqual((ACTION_YML.match(/^\s+overwrite: true$/gm) || []).length, 2);
+    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent-tag \}\}\.md/);
+    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent-tag \}\}\.json/);
+  });
+
+  test('the comment is relinked after the uploads, from the upload steps own URLs', () => {
+    assert.match(ACTION_YML, /run: node "\$GITHUB_ACTION_PATH\/link-report\.js"/);
+    assert.match(ACTION_YML, /REPORT_URL: \$\{\{ steps\.upload-report\.outputs\.artifact-url \}\}/);
+    assert.match(ACTION_YML, /JSON_URL: \$\{\{ steps\.upload-verdict\.outputs\.artifact-url \}\}/);
+    // Failing verdicts are when the link matters, and comment: false means no comment to edit.
+    assert.match(ACTION_YML, /if: always\(\) && inputs\.upload-report == 'true' && inputs\.comment == 'true'/);
   });
 
   test('the artifact name in action.yml matches the one main.js promises in the comment', () => {
@@ -1313,7 +1327,7 @@ describe('action.yml defaults', () => {
     // artifact name has to read the resolved value from the review step's
     // own output, the same source the --artifact-name flag uses, or the two diverge
     // the moment a mention switches the agent.
-    assert.match(ACTION_YML, /name: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent-tag \}\}/);
+    assert.match(ACTION_YML, /STAGE_NAME: tea-test-review-\$\{\{ github\.job \}\}-\$\{\{ steps\.review\.outputs\.agent-tag \}\}/);
   });
 });
 

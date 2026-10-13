@@ -282,10 +282,9 @@ inputs:
     default: 'test-review.json'
   upload-report:
     description: |
-      Upload report-path and json-path as the tea-test-review-<job>-<agent>
-      artifact on the workflow run, even when the verdict fails. The comment
-      carries only the verdict and up to three gating findings, so the artifact
-      is where the full report lives, and the comment names it. Set to 'false'
+      Upload report-path and json-path as separate, unzipped
+      tea-test-review-<job>-<agent>.md and .json artifacts, even when the
+      verdict fails. The comment links the files after upload. Set to 'false'
       to manage artifacts yourself.
     required: false
     default: 'true'
@@ -416,7 +415,7 @@ outputs:
     description: "'true' when there were no changed test files to review. A skip and a pass both exit 0, so this is the only way to tell them apart."
     value: ${{ steps.review.outputs.skipped }}
   report-path:
-    description: 'Workspace-relative path of the markdown report, also uploaded as the tea-test-review-<job>-<agent> artifact.'
+    description: 'Workspace-relative path of the markdown report, also uploaded as the tea-test-review-<job>-<agent>.md artifact.'
     value: ${{ steps.review.outputs.report-path }}
   json-path:
     description: 'Workspace-relative path of the verdict JSON.'
@@ -528,16 +527,70 @@ runs:
         INPUT_UPLOAD-REPORT: ${{ inputs.upload-report }}
 
     # always(): a failing verdict is exactly when the report matters, and a
-    # failed step skips what follows without it. overwrite because two
-    # invocations in one job (a dry run, then a live review) share the name,
-    # and v4 artifacts are immutable otherwise.
-    - name: Upload the report and verdict
-      if: always() && inputs.upload-report == 'true'
-      uses: actions/upload-artifact@v4
+    # failed step skips what follows without it. The report and the verdict
+    # upload as two unzipped artifacts (archive: false), so the comment can
+    # link the markdown itself with no zip to open. The staged copies carry
+    # the agent tag because an unzipped artifact is named after its file, and
+    # two reviews in one workflow must not share a name. Overwrite because
+    # two invocations in one job (a dry run, then a live review) share it,
+    # and v4+ artifacts are immutable otherwise.
+    - name: Stage the report and verdict for upload
+      id: stage
+      # The review sets json-path only after the CLI runs. A skipped invocation
+      # or an install failure must not re-upload an earlier invocation's files.
+      if: always() && inputs.upload-report == 'true' && steps.review.outputs.json-path != ''
+      shell: bash
+      env:
+        STAGE_NAME: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent-tag }}
+        REPORT_PATH: ${{ inputs.report-path }}
+        JSON_PATH: ${{ inputs.json-path }}
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/tea-test-review-upload"
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        if [ -f "$REPORT_PATH" ]; then
+          cp "$REPORT_PATH" "$dir/$STAGE_NAME.md"
+          echo "report=$dir/$STAGE_NAME.md" >> "$GITHUB_OUTPUT"
+        fi
+        if [ -f "$JSON_PATH" ]; then
+          cp "$JSON_PATH" "$dir/$STAGE_NAME.json"
+          echo "verdict=$dir/$STAGE_NAME.json" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload the report
+      id: upload-report
+      if: always() && inputs.upload-report == 'true' && steps.stage.outputs.report != ''
+      uses: actions/upload-artifact@v7
       with:
-        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent-tag }}
-        path: |
-          ${{ inputs.report-path }}
-          ${{ inputs.json-path }}
+        # v7 deletes by `name` before upload, even when archive: false derives
+        # the uploaded name from the filename. Keep both names identical.
+        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent-tag }}.md
+        path: ${{ steps.stage.outputs.report }}
+        archive: false
         if-no-files-found: warn
         overwrite: true
+
+    - name: Upload the verdict
+      id: upload-verdict
+      if: always() && inputs.upload-report == 'true' && steps.stage.outputs.verdict != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: tea-test-review-${{ github.job }}-${{ steps.review.outputs.agent-tag }}.json
+        path: ${{ steps.stage.outputs.verdict }}
+        archive: false
+        if-no-files-found: warn
+        overwrite: true
+
+    # The CLI posts the comment before this upload exists, so the comment can
+    # only promise the artifact. This swaps that promise for the file links.
+    - name: Link the report in the comment
+      if: always() && inputs.upload-report == 'true' && inputs.comment == 'true'
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/link-report.js"
+      env:
+        REPORT_URL: ${{ steps.upload-report.outputs.artifact-url }}
+        JSON_URL: ${{ steps.upload-verdict.outputs.artifact-url }}
+        AGENT_TAG: ${{ steps.review.outputs.agent-tag }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_API_URL: ${{ inputs.github-api-url }}
