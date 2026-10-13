@@ -175,7 +175,7 @@ model generation. The slug that ran is recorded in the verdict JSON next to
 
 ### Dual reviews (Codex & Claude)
 
-Run multiple review steps in the same workflow. Comments (`<!-- tea-test-review:<agent> -->`) and report artifacts (`tea-test-review-<job>-<agent>`) tag by the `agent` key, so each agent posts its own comment without collision:
+Run multiple review steps in the same workflow. Comments (`<!-- tea-test-review:<agent> -->`) and report artifacts (`tea-test-review-<job>-<agent>.md` and `.json`) tag by the `agent` key, so each agent posts its own comment without collision:
 
 ```yaml
 steps:
@@ -365,10 +365,13 @@ a `pull_request_target` workflow with strict controls.
 
 ## Artifacts
 
-`report-path` and `json-path` upload as the `tea-test-review-<job>-<agent>`
-artifact on every run, including a failed verdict. The comment carries only the
-verdict and up to three gating findings, so the artifact is where the full
-report lives; the comment names it.
+`report-path` and `json-path` upload on every run, including a failed verdict,
+as two unzipped artifacts named `tea-test-review-<job>-<agent>.md` and
+`tea-test-review-<job>-<agent>.json`. The comment carries only the verdict and up
+to three gating findings, so the markdown report is where the full review lives.
+After the upload, the action edits the comment so its last line links straight to
+both files: open or save the markdown and hand it to your agent. The link edit needs
+`pull-requests: write` like the comment itself, and a failure there is a warning.
 Opt out with `upload-report: 'false'`.
 
 ## Configuration
