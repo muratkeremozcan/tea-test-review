@@ -46,6 +46,7 @@ describe('relinkBody', () => {
 });
 
 describe('run', () => {
+  /** Build a pull request event and the action environment for one test run. */
   function setup() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'link-report-'));
     const event = path.join(dir, 'event.json');
@@ -61,12 +62,14 @@ describe('run', () => {
     };
   }
 
-  function fakeFetch(comments, { patchStatus = 200, login = 'reviewer' } = {}) {
+  /** Record GitHub API calls while modeling both user and installation tokens. */
+  function fakeFetch(comments, { patchStatus = 200, login = 'reviewer', restUserStatus = 200, graphqlLogin = login } = {}) {
     const calls = [];
     globalThis.fetch = async (url, init = {}) => {
       calls.push({ url, method: init.method, body: init.body });
       if (init.method === 'PATCH') return { ok: patchStatus === 200, status: patchStatus, json: async () => ({}), text: async () => 'nope' };
-      if (url.endsWith('/user')) return { ok: true, status: 200, json: async () => ({ login }), text: async () => '' };
+      if (url.endsWith('/user')) return { ok: restUserStatus === 200, status: restUserStatus, json: async () => ({ login }), text: async () => 'nope' };
+      if (url.endsWith('/graphql')) return { ok: true, status: 200, json: async () => ({ data: { viewer: graphqlLogin ? { login: graphqlLogin } : null } }), text: async () => '' };
       return { ok: true, status: 200, json: async () => comments.map((comment) => ({ user: { login }, ...comment })), text: async () => '' };
     };
     return calls;
@@ -94,6 +97,31 @@ describe('run', () => {
     await run(setup());
     const patch = calls.find((c) => c.method === 'PATCH');
     assert.strictEqual(patch.url, 'https://api.test/repos/o/r/issues/comments/2');
+  });
+
+  test('uses the installation viewer to distinguish another bot with the same marker', async () => {
+    const calls = fakeFetch([
+      { id: 1, body: BODY, user: { login: 'other[bot]', type: 'Bot' } },
+      { id: 2, body: BODY, user: { login: 'github-actions[bot]', type: 'Bot' } },
+    ], { restUserStatus: 403, graphqlLogin: 'github-actions[bot]' });
+    await run({ ...setup(), GITHUB_ACTIONS: 'true' });
+    const patch = calls.find((c) => c.method === 'PATCH');
+    assert.strictEqual(patch.url, 'https://api.test/repos/o/r/issues/comments/2');
+  });
+
+  test('leaves comments alone when the token identity cannot be determined', async () => {
+    const calls = fakeFetch([{ id: 1, body: BODY, user: { login: 'other[bot]', type: 'Bot' } }], {
+      restUserStatus: 403,
+      graphqlLogin: null,
+    });
+    await run({ ...setup(), GITHUB_ACTIONS: 'true' });
+    assert.ok(!calls.some((c) => c.method === 'PATCH'));
+  });
+
+  test('uses the Enterprise GraphQL endpoint for an installation token', async () => {
+    const calls = fakeFetch([{ id: 2, body: BODY }], { restUserStatus: 403 });
+    await run({ ...setup(), GITHUB_API_URL: 'https://ghes.test/api/v3' });
+    assert.ok(calls.some((c) => c.url === 'https://ghes.test/api/graphql'));
   });
 
   test('a failed patch is a warning and never a failure', async () => {

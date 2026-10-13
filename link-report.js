@@ -20,6 +20,7 @@ const MAX_PAGES = 10;
 /** The CLI's report sentence: "Report and verdict JSON: ..." or, when no report was written, "Verdict JSON: ...". */
 const REPORT_LINE = /^(?:Report and verdict JSON|Verdict JSON): .*$/m;
 
+/** Escape a GitHub artifact URL for a markdown link. */
 function link(label, url) {
   return url ? `[${label}](${String(url).replaceAll(')', '%29')})` : null;
 }
@@ -42,6 +43,7 @@ function relinkBody(body, urls) {
   return next === body ? null : next;
 }
 
+/** Send one authenticated GitHub REST or GraphQL request. */
 async function api({ apiUrl, token }, method, route, body) {
   const res = await fetch(`${String(apiUrl || 'https://api.github.com').replace(/\/+$/, '')}${route}`, {
     method,
@@ -58,29 +60,46 @@ async function api({ apiUrl, token }, method, route, body) {
   return res.json();
 }
 
-/** Match the CLI's ownership check so a quoted marker cannot divert the edit. */
+/** Resolve the GraphQL endpoint from GitHub.com or a GitHub Enterprise REST URL. */
+function graphqlApiUrl(apiUrl) {
+  const base = String(apiUrl || 'https://api.github.com').replace(/\/+$/, '');
+  return base.endsWith('/api/v3') ? base.replace(/\/api\/v3$/, '/api/graphql') : `${base}/graphql`;
+}
+
+/** Identify the token's exact author so another bot cannot divert the edit. */
 async function commentAuthor(ctx) {
   try {
     const user = await api(ctx, 'GET', '/user');
-    return typeof user.login === 'string' && user.login ? user.login : null;
+    if (typeof user.login === 'string' && user.login) return user.login;
+  } catch {
+    // Installation tokens cannot call /user. GraphQL viewer supports them.
+  }
+  try {
+    const result = await api({ ...ctx, apiUrl: graphqlApiUrl(ctx.apiUrl) }, 'POST', '', {
+      query: 'query { viewer { login } }',
+    });
+    const login = result.data?.viewer?.login;
+    return typeof login === 'string' && login ? login : null;
   } catch {
     return null;
   }
 }
 
 /** The comment the CLI upserted for this agent, found by marker and author. */
-async function findComment(ctx, { owner, repo }, prNumber, marker, { login = null, botOnly = false } = {}) {
+async function findComment(ctx, { owner, repo }, prNumber, marker, login) {
+  if (!login) return null;
   const candidates = [];
   for (let page = 1; page <= MAX_PAGES; page += 1) {
     const comments = await api(ctx, 'GET', `/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100&page=${page}`);
     candidates.push(...comments.filter((c) =>
       typeof c.body === 'string' && c.body.trimStart().startsWith(marker) &&
-      (login ? c.user?.login === login : !botOnly || c.user?.type === 'Bot')));
+      c.user?.login === login));
     if (comments.length < 100) break;
   }
   return candidates.find((c) => c.user?.type === 'Bot') ?? candidates[0] ?? null;
 }
 
+/** Link uploaded artifacts in this token's review comment without affecting the gate. */
 async function run(env = process.env) {
   const warn = (msg) => console.log(`::warning::tea-test-review: ${msg}`);
   const urls = { reportUrl: env.REPORT_URL || '', jsonUrl: env.JSON_URL || '' };
@@ -92,10 +111,11 @@ async function run(env = process.env) {
     if (!prNumber || !repo || !env.GITHUB_TOKEN || !env.AGENT_TAG) return 0;
     const ctx = { apiUrl: env.GITHUB_API_URL, token: env.GITHUB_TOKEN };
     const login = await commentAuthor(ctx);
-    const comment = await findComment(ctx, repo, prNumber, `<!-- tea-test-review:${env.AGENT_TAG} -->`, {
-      login,
-      botOnly: env.GITHUB_ACTIONS === 'true',
-    });
+    if (!login) {
+      warn('Could not identify the comment author, so the review comment was left unchanged. The artifact is still on the run.');
+      return 0;
+    }
+    const comment = await findComment(ctx, repo, prNumber, `<!-- tea-test-review:${env.AGENT_TAG} -->`, login);
     if (!comment) return 0;
     const body = relinkBody(comment.body, urls);
     if (!body) return 0;
