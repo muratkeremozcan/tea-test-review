@@ -30,49 +30,55 @@ function jobText(job) {
 
 const DRAFT_JOB = jobText('draft');
 
-/** The first key of every step of a job. A step that starts with another key fails here. */
-const stepNames = (job) =>
-  [...jobText(job).matchAll(/^ {6}- (.*)$/gm)].map((match) => {
-    const found = /^name: (.+)$/.exec(match[1]);
-    assert.ok(found, `${job}: every step starts with its name, got "- ${match[1]}"`);
-    return found[1];
+/**
+ * Every step of a job, by position, as `{ name, text, env, run }` with `run` dedented the way the
+ * runner reads it. A step that starts with a key other than its name, or a name used twice, fails
+ * here, so no step escapes a check that looks steps up by name.
+ */
+function steps(job) {
+  const text = jobText(job);
+  const starts = [...text.matchAll(/^ {6}- /gm)].map((match) => match.index);
+  const parsed = starts.map((start, i) => {
+    const lines = text.slice(start, starts[i + 1]).trimEnd().split('\n');
+    const named = /^ {6}- name: (.+)$/.exec(lines[0]);
+    assert.ok(named, `${job}: every step starts with its name, got "${lines[0].trim()}"`);
+
+    const env = {};
+    const envAt = lines.indexOf('        env:');
+    if (envAt > -1) {
+      for (const line of lines.slice(envAt + 1)) {
+        const found = /^ {10}([A-Z_]+): (.+)$/.exec(line);
+        if (!found) break;
+        env[found[1]] = found[2];
+      }
+    }
+
+    let run;
+    const runAt = lines.findIndex((line) => line.startsWith('        run: '));
+    if (runAt > -1 && lines[runAt] === '        run: |') {
+      const body = [];
+      for (const line of lines.slice(runAt + 1)) {
+        if (line !== '' && !line.startsWith(' '.repeat(10))) break;
+        body.push(line.slice(10));
+      }
+      run = `${body.join('\n').trimEnd()}\n`;
+    } else if (runAt > -1) {
+      run = lines[runAt].slice('        run: '.length);
+    }
+    return { name: named[1], text: lines.join('\n'), env, run };
   });
+  const names = parsed.map((s) => s.name);
+  assert.strictEqual(new Set(names).size, names.length, `${job}: step names are unique`);
+  return parsed;
+}
+
+const stepNames = (job) => steps(job).map((s) => s.name);
 const stepIndex = (job, name) => {
   const index = stepNames(job).indexOf(name);
   assert.ok(index > -1, `${job} has the step ${name}`);
   return index;
 };
-
-/** One step of a job as `{ text, env, run }`, with `run` dedented the way the runner reads it. */
-function step(job, name) {
-  const text = jobText(job);
-  const start = text.indexOf(`\n      - name: ${name}\n`);
-  assert.ok(start > -1, `${job} has the step ${name}`);
-  const next = text.indexOf('\n      - ', start + 1);
-  const lines = text.slice(start + 1, next === -1 ? undefined : next).split('\n');
-
-  const env = {};
-  const envAt = lines.indexOf('        env:');
-  if (envAt > -1) {
-    for (const line of lines.slice(envAt + 1)) {
-      const found = /^ {10}([A-Z_]+): (.+)$/.exec(line);
-      if (!found) break;
-      env[found[1]] = found[2];
-    }
-  }
-
-  let run;
-  const runAt = lines.indexOf('        run: |');
-  if (runAt > -1) {
-    const body = [];
-    for (const line of lines.slice(runAt + 1)) {
-      if (line !== '' && !line.startsWith(' '.repeat(10))) break;
-      body.push(line.slice(10));
-    }
-    run = `${body.join('\n').trimEnd()}\n`;
-  }
-  return { text: lines.join('\n'), env, run };
-}
+const step = (job, name) => steps(job)[stepIndex(job, name)];
 
 describe('triggers and permissions', () => {
   test('prepares from a bump choice and promotes only published releases', () => {
@@ -101,13 +107,9 @@ describe('triggers and permissions', () => {
   test('the jobs that write run no repository code', () => {
     for (const job of ['draft', 'promote']) {
       assert.doesNotMatch(jobText(job), /uses:/, job);
-      assert.strictEqual(
-        (jobText(job).match(/^ {8}run: /gm) || []).length,
-        stepNames(job).length,
-        `${job}: every step is a named run step`
-      );
-      for (const name of stepNames(job)) {
-        assert.doesNotMatch(step(job, name).run, /\bnode\b|\bnpm\b|scripts\//, `${job}: ${name}`);
+      for (const { name, run } of steps(job)) {
+        assert.ok(run, `${job}: ${name} is a run step`);
+        assert.doesNotMatch(run, /\bnode\b|\bnpm\b|scripts\//, `${job}: ${name}`);
       }
     }
   });
