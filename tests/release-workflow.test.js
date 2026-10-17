@@ -64,6 +64,7 @@ function steps(job) {
       run = `${body.join('\n').trimEnd()}\n`;
     } else if (runAt > -1) {
       run = lines[runAt].slice('        run: '.length);
+      assert.match(run, /^[^|>'"&*!]/, `${job}: ${named[1]} uses run: | or a plain one-line run`);
     }
     return { name: named[1], text: lines.join('\n'), env, run };
   });
@@ -106,7 +107,8 @@ describe('triggers and permissions', () => {
 
   test('the jobs that write run no repository code', () => {
     for (const job of ['draft', 'promote']) {
-      assert.doesNotMatch(jobText(job), /uses:/, job);
+      // The whole job text, so no YAML form of a step hides a command from this check.
+      assert.doesNotMatch(jobText(job), /uses:|\bnode\b|\bnpm\b|scripts\//, job);
       for (const { name, run } of steps(job)) {
         assert.ok(run, `${job}: ${name} is a run step`);
         assert.doesNotMatch(run, /\bnode\b|\bnpm\b|scripts\//, `${job}: ${name}`);
