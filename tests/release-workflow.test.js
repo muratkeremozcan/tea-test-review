@@ -30,7 +30,13 @@ function jobText(job) {
 
 const DRAFT_JOB = jobText('draft');
 
-const stepNames = (job) => [...jobText(job).matchAll(/^ {6}- name: (.+)$/gm)].map((match) => match[1]);
+/** The first key of every step of a job. A step that starts with another key fails here. */
+const stepNames = (job) =>
+  [...jobText(job).matchAll(/^ {6}- (.*)$/gm)].map((match) => {
+    const found = /^name: (.+)$/.exec(match[1]);
+    assert.ok(found, `${job}: every step starts with its name, got "- ${match[1]}"`);
+    return found[1];
+  });
 const stepIndex = (job, name) => {
   const index = stepNames(job).indexOf(name);
   assert.ok(index > -1, `${job} has the step ${name}`);
@@ -42,7 +48,7 @@ function step(job, name) {
   const text = jobText(job);
   const start = text.indexOf(`\n      - name: ${name}\n`);
   assert.ok(start > -1, `${job} has the step ${name}`);
-  const next = text.indexOf('\n      - name: ', start + 1);
+  const next = text.indexOf('\n      - ', start + 1);
   const lines = text.slice(start + 1, next === -1 ? undefined : next).split('\n');
 
   const env = {};
@@ -95,6 +101,11 @@ describe('triggers and permissions', () => {
   test('the jobs that write run no repository code', () => {
     for (const job of ['draft', 'promote']) {
       assert.doesNotMatch(jobText(job), /uses:/, job);
+      assert.strictEqual(
+        (jobText(job).match(/^ {8}run: /gm) || []).length,
+        stepNames(job).length,
+        `${job}: every step is a named run step`
+      );
       for (const name of stepNames(job)) {
         assert.doesNotMatch(step(job, name).run, /\bnode\b|\bnpm\b|scripts\//, `${job}: ${name}`);
       }
@@ -286,12 +297,13 @@ if (args[0] !== 'api') fail('unexpected command ' + args.join(' '));
 let method = 'GET';
 let jq = null;
 let endpoint = null;
+let paginate = false;
 const fields = {};
 for (let i = 1; i < args.length; i++) {
   const arg = args[i];
   if (arg === '--method') method = args[++i];
   else if (arg === '--jq') jq = args[++i];
-  else if (arg === '--paginate') continue;
+  else if (arg === '--paginate') paginate = true;
   else if (arg === '-f' || arg === '-F') {
     const [name, ...value] = args[++i].split('=');
     fields[name] = value.join('=');
@@ -300,11 +312,22 @@ for (let i = 1; i < args.length; i++) {
 const repo = 'repos/' + process.env.GITHUB_REPOSITORY + '/';
 if (!endpoint || !endpoint.startsWith(repo)) fail('unexpected endpoint ' + endpoint);
 const route = endpoint.slice(repo.length);
+const print = (body) => {
+  if (jq === null) return process.stdout.write(JSON.stringify(body) + '\\n');
+  const out = spawnSync('jq', ['-r', jq], { input: JSON.stringify(body), encoding: 'utf8' });
+  if (out.status !== 0) fail('jq failed: ' + out.stderr);
+  process.stdout.write(out.stdout);
+};
 let body;
 let match;
 if (method === 'GET' && route === 'releases?per_page=100') {
   if (state.releasesDown) fail('Server Error (HTTP 502)');
-  body = state.releases;
+  // Like gh, --paginate applies --jq to every page; without it only the first page arrives.
+  const size = state.pageSize || 100;
+  const pages = [];
+  for (let i = 0; i < state.releases.length; i += size) pages.push(state.releases.slice(i, i + size));
+  for (const page of paginate ? pages : pages.slice(0, 1)) print(page);
+  process.exit(0);
 } else if (method === 'GET' && (match = /^git\\/ref\\/tags\\/(.+)$/.exec(route))) {
   const ref = state.refs[match[1]];
   if (!ref) fail('Not Found (HTTP 404)');
@@ -325,12 +348,7 @@ if (method === 'GET' && route === 'releases?per_page=100') {
   save();
   body = {};
 } else fail('unexpected call ' + method + ' ' + route);
-if (jq === null) process.stdout.write(JSON.stringify(body) + '\\n');
-else {
-  const out = spawnSync('jq', ['-r', jq], { input: JSON.stringify(body), encoding: 'utf8' });
-  if (out.status !== 0) fail('jq failed: ' + out.stderr);
-  process.stdout.write(out.stdout);
-}
+print(body);
 `;
 
 const SHA = {
@@ -480,6 +498,23 @@ describe('promoting the floating major against the published releases', () => {
     assert.deepStrictEqual(older.mutations, []);
   });
 
+  test('a newer release on a later page of the releases still keeps the major', () => {
+    const state = {
+      releases: published('v1.0.0', 'v1.0.1'),
+      pageSize: 1,
+      refs: {
+        'v1.0.0': { type: 'commit', sha: SHA.v100 },
+        'v1.0.1': { type: 'commit', sha: SHA.v101 },
+        v1: { type: 'commit', sha: SHA.v101 },
+      },
+      tags: {},
+    };
+    const run = promote(state, { tag: 'v1.0.0', sha: SHA.v100 });
+    assert.notStrictEqual(run.status, 0);
+    assert.match(run.stderr, /v1\.0\.0 is older than v1\.0\.1/);
+    assert.deepStrictEqual(run.mutations, []);
+  });
+
   test('a major with no tag yet is created at the release', () => {
     const state = {
       releases: published('v1.0.0'),
@@ -548,6 +583,10 @@ describe('promoting the floating major against the published releases', () => {
     const current = runStep(recheck, state, values('v1.0.1'));
     assert.strictEqual(current.status, 0, current.stderr);
     assert.strictEqual(current.output, 'current=true\n');
+
+    const paged = runStep(recheck, { ...state, releases: published('v1.0.0', 'v1.0.1'), pageSize: 1 }, values('v1.0.0'));
+    assert.notStrictEqual(paged.status, 0, 'the newer release is on the second page');
+    assert.match(paged.stderr, /v1\.0\.0 was superseded by v1\.0\.1/);
   });
 
   test('a releases API that fails stops the promotion before any tag moves', () => {
