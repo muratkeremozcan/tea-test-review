@@ -1,3 +1,12 @@
+# Releases the Action in two halves.
+#
+# Run workflow on main with a bump: the prepare job runs every gate the repository defines and a
+# smoke of the Action from this checkout, derives the next exact vX.Y.Z from the published
+# releases, and the draft job creates that exact tag and a draft release with generated notes.
+#
+# Publish the draft with the Marketplace box ticked: the verify job checks the published tag,
+# reruns the gates and the smoke on it and waits for the Marketplace to list it, and the promote
+# job moves the floating major tag (v1) to the same commit.
 name: Release
 
 on:
@@ -17,8 +26,14 @@ on:
 
 permissions: {}
 
+# Dispatches queue in one group. Each published tag has a group of its own, so a later dispatch or
+# publication never cancels a pending publication. The promote job has a group per major: one
+# promotion of a major runs at a time, and it reads the highest published release of the major
+# again right before it moves the tag, so an older release never moves the major back. The group
+# queues every pending promotion (`queue: max`), so a late older one never cancels a newer one that
+# waits, and verify fails a release that a newer one superseded while it was verified.
 concurrency:
-  group: tea-test-review-release
+  group: tea-test-review-release-${{ github.event.release.tag_name || github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -34,13 +49,13 @@ jobs:
       release-sha: ${{ github.sha }}
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24'
 
@@ -54,10 +69,10 @@ jobs:
       - name: Run unit tests
         run: node --test tests/*.test.js
 
-      # This exercises the composite action, the global install of the CLI and
-      # agent, the real CLI invocation and its argv, and output mapping without paying for an
-      # agent call. The placeholder credential is never sent anywhere because
-      # the final CLI argument selects the no-agent prompt-generation mode.
+      # The composite action from this checkout: the global install of the CLI and agent, the real
+      # CLI invocation and its argv, and output mapping, without paying for an agent call. The
+      # placeholder credential is never sent anywhere because the final CLI argument selects the
+      # no-agent prompt-generation mode.
       - name: Run deterministic consumer smoke
         uses: ./
         with:
@@ -151,6 +166,16 @@ jobs:
             fi
           }
 
+          publish_steps() {
+            {
+              echo "Draft release: $1"
+              echo
+              echo '1. Open the draft and click Edit.'
+              echo '2. Tick Publish this Action to the GitHub Marketplace. On the first release, accept the agreement and pick a primary category.'
+              echo '3. Click Publish release. The Release workflow then moves the major tag on its own.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
           if release=$(gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json author,isDraft,tagName,targetCommitish,url 2>/dev/null); then
@@ -192,7 +217,8 @@ jobs:
             fi
             verify_exact_tag
             url=$(jq -r '.url' <<< "$release")
-            echo "Existing draft release: $url" >> "$GITHUB_STEP_SUMMARY"
+            echo 'This run found the draft an earlier run created.' >> "$GITHUB_STEP_SUMMARY"
+            publish_steps "$url"
             exit 0
           fi
 
@@ -234,8 +260,7 @@ jobs:
           fi
           verify_exact_tag
 
-          echo "Draft release: $url" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Review it, select Publish this Action to the GitHub Marketplace, then publish.' >> "$GITHUB_STEP_SUMMARY"
+          publish_steps "$url"
 
   verify:
     name: verify published release
@@ -248,18 +273,17 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       major: ${{ steps.release.outputs.major }}
       release-sha: ${{ steps.release.outputs.release-sha }}
-      highest-tag: ${{ steps.release.outputs.highest-tag }}
-      release-order: ${{ steps.release.outputs.release-order }}
+      current: ${{ steps.order.outputs.current }}
     steps:
       - name: Check out the published release
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24'
 
@@ -292,6 +316,10 @@ jobs:
           immutable=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable)
           if [ "$immutable" != 'true' ]; then
             echo "Release $TAG is mutable. Enable immutable releases before promotion." >&2
+            {
+              echo "$TAG was published while release immutability was off, so $major stays put."
+              echo 'Turn on Settings, General, Releases, Enable release immutability, then release the next patch.'
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -314,13 +342,15 @@ jobs:
             echo "tag=$TAG"
             echo "major=$major"
             echo "release-sha=$release_sha"
-            echo "highest-tag=$highest_tag"
-            echo "release-order=$release_order"
           } >> "$GITHUB_OUTPUT"
 
       - name: Run unit tests
         run: node --test tests/*.test.js
 
+      # The composite action from the published tag: the global install of the CLI and agent, the real
+      # CLI invocation and its argv, and output mapping, without paying for an agent call. The
+      # placeholder credential is never sent anywhere because the final CLI argument selects the
+      # no-agent prompt-generation mode.
       - name: Run deterministic consumer smoke
         uses: ./
         with:
@@ -349,12 +379,48 @@ jobs:
           done
 
           echo "Marketplace does not list $TAG. Confirm the release checkbox was selected." >&2
+          {
+            echo "The Marketplace does not list $TAG, so the major tag stays put."
+            echo "Open the $TAG release, click Edit, tick Publish this Action to the GitHub Marketplace, click Update release, then re-run this workflow run."
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 1
+
+      # The gates and the Marketplace wait take minutes, and a newer release of the major may have
+      # been published meanwhile. A superseded release fails here, so it never queues a promotion.
+      # The promote step reads the order once more before it moves the tag.
+      - name: Recheck the release order
+        id: order
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          MAJOR: ${{ steps.release.outputs.major }}
+        run: |
+          set -euo pipefail
+
+          highest_tag=$(gh api \
+            --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | awk -v prefix="$MAJOR." 'index($0, prefix) == 1' \
+            | node scripts/release-version.js latest)
+          release_order=$(node scripts/release-version.js compare "$TAG" "$highest_tag")
+
+          if [ "$release_order" -lt 0 ]; then
+            echo "$TAG was superseded by $highest_tag while it was verified, so $MAJOR stays with the newer release." >&2
+            echo "$highest_tag superseded $TAG while it was verified, so $MAJOR stays with $highest_tag." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo 'current=true' >> "$GITHUB_OUTPUT"
 
   promote:
     name: promote floating major
-    if: github.event_name == 'release' && github.event.action == 'published'
+    if: github.event_name == 'release' && github.event.action == 'published' && needs.verify.outputs.current == 'true'
     needs: verify
+    concurrency:
+      group: tea-test-review-promote-${{ needs.verify.outputs.major }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -366,15 +432,8 @@ jobs:
           TAG: ${{ needs.verify.outputs.tag }}
           MAJOR: ${{ needs.verify.outputs.major }}
           RELEASE_SHA: ${{ needs.verify.outputs.release-sha }}
-          HIGHEST_TAG: ${{ needs.verify.outputs.highest-tag }}
-          RELEASE_ORDER: ${{ needs.verify.outputs.release-order }}
         run: |
           set -euo pipefail
-
-          if [ "$RELEASE_ORDER" -lt 0 ]; then
-            echo "$TAG is older than the highest published $MAJOR release, $HIGHEST_TAG. $MAJOR stays put." >&2
-            exit 1
-          fi
 
           resolve_tag_commit() {
             local ref_name="$1"
@@ -403,6 +462,23 @@ jobs:
           exact_sha=$(resolve_tag_commit "$TAG")
           if [ "$exact_sha" != "$RELEASE_SHA" ]; then
             echo "$TAG resolves to $exact_sha instead of $RELEASE_SHA." >&2
+            exit 1
+          fi
+
+          # This job's concurrency group runs one promotion of the major at a time, so the highest
+          # published release of the major read here still holds when the tag moves below. A release
+          # published after verify read the order, and promoted first, keeps the major.
+          # A failed read stops the step here, before any tag moves.
+          published=$(gh api \
+            --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          newest_tag=$(printf '%s\n%s\n' "$published" "$TAG" \
+            | awk -v prefix="$MAJOR." 'index($0, prefix) == 1 && /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/' \
+            | sort -t . -k 2,2n -k 3,3n \
+            | tail -n 1)
+          if [ "$newest_tag" != "$TAG" ]; then
+            echo "$TAG is older than $newest_tag, the highest published $MAJOR release, so $MAJOR stays put." >&2
             exit 1
           fi
 
@@ -470,4 +546,4 @@ jobs:
           curl --fail --silent --show-error --location --max-time 30 \
             "https://github.com/$GITHUB_REPOSITORY/tree/$MAJOR" >/dev/null
 
-          echo "$TAG and $MAJOR both resolve to $RELEASE_SHA." >> "$GITHUB_STEP_SUMMARY"
+          echo "$TAG and $MAJOR both resolve to $RELEASE_SHA. Nothing left to click." >> "$GITHUB_STEP_SUMMARY"
