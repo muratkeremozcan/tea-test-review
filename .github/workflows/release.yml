@@ -194,7 +194,7 @@ jobs:
           # the lookup addresses the draft by its id, so a draft that replaced it in between stays put.
           if release=$(gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json author,body,databaseId,isDraft,tagName,targetCommitish,url 2>/dev/null); then
+            --json author,databaseId,isDraft,tagName,targetCommitish,url 2>/dev/null); then
             validate_draft "$release"
             release_id=$(jq -r '.databaseId' <<< "$release")
             release_target=$(jq -r '.targetCommitish' <<< "$release")
@@ -217,6 +217,13 @@ jobs:
             if [ "$tag_state" = 'stale' ] && [ "$existing_type" != 'commit' ]; then
               echo "Tag $TAG points to a $existing_type object instead of a commit." >&2
               echo 'Refusing to move a tag that this workflow did not create.' >&2
+              exit 1
+            fi
+            # This workflow moves the tag before the draft, so a draft ahead of its tag was changed by
+            # hand. Moving on from there could leave notes that no later run knows to regenerate.
+            if [ "$tag_state" = 'stale' ] && [ "$release_target" = "$RELEASE_SHA" ]; then
+              echo "Draft release $TAG targets $RELEASE_SHA, but its tag points to $existing_sha." >&2
+              echo 'Someone changed the draft or its tag by hand, so both stay as they are.' >&2
               exit 1
             fi
 
@@ -256,26 +263,25 @@ jobs:
             verify_exact_tag
 
             # The notes of an existing tag end at that tag, so they are generated once it is in place.
-            # Each run compares them, so a rerun after a run that stopped past the tag still updates them.
-            if [ "$release_author" = 'github-actions[bot]' ]; then
-              release_notes=$(gh api \
+            # The target and the notes change in one write, after the tag, so a draft whose target is
+            # stale is exactly a draft whose notes are. A draft on the release commit keeps its notes,
+            # including any a maintainer edited, and a draft someone else created reaches here only on
+            # its own commit.
+            if [ "$release_target" != "$RELEASE_SHA" ]; then
+              release_notes_file="$RUNNER_TEMP/$TAG-release-notes.md"
+              gh api \
                 --method POST \
                 "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
                 -f tag_name="$TAG" \
                 -f target_commitish="$RELEASE_SHA" \
-                --jq '.body')
-              if [ "$release_target" != "$RELEASE_SHA" ] \
-                || [ "$release_notes" != "$(jq -r '.body' <<< "$release")" ]; then
-                release_notes_file="$RUNNER_TEMP/$TAG-release-notes.md"
-                printf '%s\n' "$release_notes" > "$release_notes_file"
-                gh api \
-                  --method PATCH \
-                  "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-                  -f tag_name="$TAG" \
-                  -f target_commitish="$RELEASE_SHA" \
-                  -f name="$TAG" \
-                  -F body=@"$release_notes_file" >/dev/null
-              fi
+                --jq '.body' > "$release_notes_file"
+              gh api \
+                --method PATCH \
+                "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+                -f tag_name="$TAG" \
+                -f target_commitish="$RELEASE_SHA" \
+                -f name="$TAG" \
+                -F body=@"$release_notes_file" >/dev/null
             fi
 
             release=$(read_release)

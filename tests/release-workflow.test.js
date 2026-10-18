@@ -249,7 +249,7 @@ test('checks a found draft and its tag before the first write, and fixes the tag
     ...['move_exact_tag', 'create_exact_tag', 'releases/generate-notes', '-F body=@'].map(at)
   );
 
-  assert.match(existingDraft, /--json author,body,databaseId,isDraft,tagName,targetCommitish,url/);
+  assert.match(existingDraft, /--json author,databaseId,isDraft,tagName,targetCommitish,url/);
   assert.ok(at('validate_draft "$release"') < firstWrite);
   assert.ok(at('[ "$release_author" != \'github-actions[bot]\' ]') < firstWrite);
   assert.ok(at('[ "$existing_type" != \'commit\' ]') < firstWrite);
@@ -803,8 +803,46 @@ describe('drafting against the releases and refs', () => {
     const run = draft(state, SHA.v101);
     assert.strictEqual(run.status, 0, run.stderr);
     assert.deepStrictEqual(run.mutations, []);
+    assert.ok(!run.calls.some((c) => c.some((arg) => arg.endsWith('/releases/generate-notes'))));
     assert.deepStrictEqual(run.state, state);
     assert.match(run.summary, /found the draft an earlier run created/);
+  });
+
+  test('a rerun on the same commit keeps the notes a maintainer edited', () => {
+    const state = {
+      releases: [ownDraft({ target_commitish: SHA.v101, body: 'Edited by a maintainer' })],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v101 } },
+      tags: {},
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.mutations, []);
+    assert.deepStrictEqual(run.state, state);
+  });
+
+  test('a draft on the release commit whose tag went missing gets it back and keeps its notes', () => {
+    const state = {
+      releases: [ownDraft({ target_commitish: SHA.v101, body: 'Edited by a maintainer' })],
+      refs: {},
+      tags: {},
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.deepStrictEqual(run.state.releases, state.releases);
+    assert.strictEqual(run.mutations.length, 1, 'only the tag');
+  });
+
+  test("a maintainer's draft on its own commit gets its missing tag and keeps its notes", () => {
+    const state = {
+      releases: [ownDraft({ author: 'maintainer', target_commitish: SHA.v101 })],
+      refs: {},
+      tags: {},
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.deepStrictEqual(run.state.releases, state.releases);
   });
 
   test('a rerun after a run that moved the tag but not the draft moves the draft', () => {
@@ -824,23 +862,9 @@ describe('drafting against the releases and refs', () => {
     );
   });
 
-  test('a rerun after a run that stopped before the notes updates the notes', () => {
-    // The draft already targets the new commit; only the notes still end at the old tag.
-    const state = {
-      releases: [ownDraft({ target_commitish: SHA.v101 })],
-      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v101 } },
-      tags: {}
-    };
-    const run = draft(state, SHA.v101);
-    assert.strictEqual(run.status, 0, run.stderr);
-    assert.strictEqual(run.state.releases[0].body, `Changes up to ${SHA.v101}`);
-    assert.strictEqual(run.mutations.length, 1);
-  });
-
   test('a rerun after the notes failed past the tag move updates the notes', () => {
-    // The draft already targets the new commit, and its tag still points to the old one.
     const state = {
-      releases: [ownDraft({ target_commitish: SHA.v101 })],
+      releases: [ownDraft()],
       refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
       tags: {},
       notesDown: true,
@@ -848,15 +872,16 @@ describe('drafting against the releases and refs', () => {
     const failed = draft(state, SHA.v101);
     assert.notStrictEqual(failed.status, 0);
     assert.deepStrictEqual(failed.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
-    assert.strictEqual(failed.state.releases[0].body, `Changes up to ${SHA.v100}`);
+    assert.deepStrictEqual(failed.state.releases, state.releases);
 
     const rerun = draft({ ...failed.state, notesDown: false }, SHA.v101);
     assert.strictEqual(rerun.status, 0, rerun.stderr);
+    assert.strictEqual(rerun.state.releases[0].target_commitish, SHA.v101);
     assert.strictEqual(rerun.state.releases[0].body, `Changes up to ${SHA.v101}`);
     assert.deepStrictEqual(
       rerun.mutations.map((c) => c.find((arg) => arg.startsWith('repos/'))),
       ['repos/owner/action/releases/7'],
-      'the tag is already current, so only the notes change'
+      'the tag is already current, so only the draft changes'
     );
   });
 
@@ -896,6 +921,17 @@ describe('drafting against the releases and refs', () => {
     };
     refused(state, /belongs to maintainer\.\nRefusing to retarget a draft that this workflow did not create/);
     refused({ ...state, refs: {} }, /belongs to maintainer/);
+  });
+
+  test('a draft ahead of its tag keeps its tag and its notes', () => {
+    refused(
+      {
+        releases: [ownDraft({ target_commitish: SHA.v101 })],
+        refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+        tags: {},
+      },
+      /Draft release v1\.0\.0 targets b{40}, but its tag points to a{40}\.\nSomeone changed the draft or its tag by hand/
+    );
   });
 
   test('a tag with no draft stays where it is', () => {
