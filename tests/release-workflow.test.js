@@ -4,8 +4,9 @@
  * Tests for the Release workflow. It writes tags and releases with the repository token, so it
  * keeps its guards: least privilege per job, write jobs that run no repository code, the unit tests
  * and the consumer smoke before a draft and again before the floating major tag moves, the
- * immutable and Marketplace checks, and the tag handling that never moves an exact tag or rolls a
- * major back. The repository has no dependencies, so the steps are read from the workflow text.
+ * immutable and Marketplace checks, and the tag handling that moves an exact tag only with the
+ * unpublished draft this workflow created for it and never rolls a major back. The repository has
+ * no dependencies, so the steps are read from the workflow text.
  */
 
 const { describe, test } = require('node:test');
@@ -223,41 +224,37 @@ describe('Marketplace and the floating major tag', () => {
 });
 
 describe('the draft', () => {
-  test('keeps the existing-tag guard and creates a missing exact tag before a new draft', () => {
-    const tagLookup = DRAFT_JOB.indexOf('if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"');
-    const mismatchGuard = DRAFT_JOB.indexOf('Tag $TAG already points to $existing_sha instead of $RELEASE_SHA.');
-    const tagCreation = DRAFT_JOB.indexOf('-f ref="refs/tags/$TAG"');
+  test('creates a missing exact tag before a new draft with generated notes', () => {
     const releaseCreation = DRAFT_JOB.indexOf('gh release create "$TAG"');
-    const newDraftTagGuard = DRAFT_JOB.lastIndexOf('if [ "$tag_preexisted" = \'false\' ]; then', releaseCreation);
-    const newDraftPreparation = DRAFT_JOB.slice(newDraftTagGuard, releaseCreation);
+    const newDraftTagGuard = DRAFT_JOB.lastIndexOf('if [ "$tag_state" = \'missing\' ]; then', releaseCreation);
 
-    assert.ok(tagLookup > -1 && tagLookup < releaseCreation);
-    assert.ok(mismatchGuard > tagLookup && mismatchGuard < releaseCreation);
-    assert.ok(tagCreation > mismatchGuard && tagCreation < releaseCreation);
-    assert.ok(newDraftTagGuard > tagCreation);
-    assert.match(newDraftPreparation, /create_exact_tag/);
+    assert.ok(newDraftTagGuard > -1 && newDraftTagGuard < releaseCreation);
+    assert.match(DRAFT_JOB.slice(newDraftTagGuard, releaseCreation), /create_exact_tag/);
     assert.match(DRAFT_JOB, /--draft/);
     assert.match(DRAFT_JOB, /--generate-notes/);
     assert.match(DRAFT_JOB, /--target "\$RELEASE_SHA"/);
     assert.doesNotMatch(DRAFT_JOB, /--verify-tag/);
   });
 
-  test('retargets an automated stale draft before repairing its missing exact tag', () => {
-    const existingDraftStart = DRAFT_JOB.indexOf('if release=$(gh release view "$TAG"');
-    const existingDraftEnd = DRAFT_JOB.indexOf('# Let the Releases API');
-    const existingDraft = DRAFT_JOB.slice(existingDraftStart, existingDraftEnd);
-    const retarget = existingDraft.indexOf('gh release edit "$TAG"');
-    const tagRepair = existingDraft.indexOf('create_exact_tag');
+test('checks a found draft and its tag before the first write, and fixes the tag before the notes', () => {
+  const existingDraftStart = DRAFT_JOB.indexOf('if release=$(gh release view "$TAG"');
+  const existingDraftEnd = DRAFT_JOB.indexOf('# Let the Releases API');
+  const existingDraft = DRAFT_JOB.slice(existingDraftStart, existingDraftEnd);
+  const at = (text) => {
+    const index = existingDraft.indexOf(text);
+    assert.ok(index > -1, `the found-draft branch has ${text}`);
+    return index;
+  };
+  const firstWrite = Math.min(
+    ...['move_exact_tag', 'create_exact_tag', 'releases/generate-notes', '-F body=@'].map(at)
+  );
 
-    assert.match(existingDraft, /--json author,isDraft,tagName,targetCommitish,url/);
-    assert.match(existingDraft, /validate_draft "\$release"/);
-    assert.match(existingDraft, /if \[ "\$release_target" != "\$RELEASE_SHA" \]/);
-    assert.match(existingDraft, /if \[ "\$release_author" != 'github-actions\[bot\]' \]/);
-    assert.match(existingDraft, /releases\/generate-notes/);
-    assert.ok(retarget > -1 && retarget < tagRepair);
-    assert.match(existingDraft, /verify_exact_tag/);
-  });
-
+  assert.match(existingDraft, /--json author,databaseId,isDraft,tagName,targetCommitish,url/);
+  assert.ok(at('validate_draft "$release"') < firstWrite);
+  assert.ok(at('[ "$release_author" != \'github-actions[bot]\' ]') < firstWrite);
+  assert.ok(at('[ "$existing_type" != \'commit\' ]') < firstWrite);
+  assert.ok(at('verify_exact_tag') < at('releases/generate-notes'));
+});
   test("verifies the created draft's own tag and accepts its synthetic URL", () => {
     const releaseCreation = DRAFT_JOB.indexOf('gh release create "$TAG"');
     const releaseVerification = DRAFT_JOB.indexOf('created_release=$(gh release view "$TAG"');
@@ -297,6 +294,56 @@ const fail = (message) => {
   process.stderr.write('gh: ' + message + '\\n');
   process.exit(1);
 };
+const notes = (sha) => 'Changes up to ' + sha;
+if (args[0] === 'release') {
+  // gh release view and create over the same releases, by tag name, drafts included.
+  const [, command, tag] = args;
+  const options = {};
+  for (let i = 3; i < args.length; i++) {
+    const name = args[i].slice(2);
+    options[name] = name === 'draft' || name === 'generate-notes' ? true : args[++i];
+  }
+  const release = state.releases.find((r) => r.tag_name === tag);
+  if (command === 'view') {
+    if (!release) fail('release not found');
+    const fieldsOf = {
+      author: { login: release.author },
+      body: release.body,
+      databaseId: release.id,
+      isDraft: release.draft,
+      tagName: release.tag_name,
+      targetCommitish: release.target_commitish,
+      url: release.url,
+    };
+    const picked = {};
+    for (const name of (options.json || 'url').split(',')) picked[name] = fieldsOf[name];
+    process.stdout.write(JSON.stringify(picked) + '\\n');
+    // What a maintainer may do to the draft right after a run looked it up.
+    if (state.onView === 'publish') {
+      release.draft = false;
+      delete state.onView;
+      save();
+    }
+  } else if (command === 'create') {
+    if (release) fail('a release with the same tag name already exists');
+    const url = 'https://github.com/' + process.env.GITHUB_REPOSITORY + '/releases/tag/untagged-new';
+    const ref = state.refs[tag];
+    state.releases.unshift({
+      id: 100 + state.releases.length,
+      tag_name: tag,
+      draft: true,
+      prerelease: false,
+      author: 'github-actions[bot]',
+      target_commitish: options.target,
+      url,
+      name: options.title,
+      body: notes(ref ? ref.sha : options.target),
+    });
+    save();
+    process.stdout.write(url + '\\n');
+  } else fail('unexpected release command ' + command);
+  process.exit(0);
+}
 if (args[0] !== 'api') fail('unexpected command ' + args.join(' '));
 let method = 'GET';
 let jq = null;
@@ -311,6 +358,9 @@ for (let i = 1; i < args.length; i++) {
   else if (arg === '-f' || arg === '-F') {
     const [name, ...value] = args[++i].split('=');
     fields[name] = value.join('=');
+    if (arg === '-F' && fields[name].startsWith('@')) {
+      fields[name] = fs.readFileSync(fields[name].slice(1), 'utf8').trim();
+    }
   } else endpoint = arg;
 }
 const repo = 'repos/' + process.env.GITHUB_REPOSITORY + '/';
@@ -340,10 +390,55 @@ if (method === 'GET' && route === 'releases?per_page=100') {
   const tag = state.tags[match[1]];
   if (!tag) fail('Not Found (HTTP 404)');
   body = { sha: match[1], object: tag };
+} else if (method === 'DELETE' && (match = /^git\\/refs\\/tags\\/(.+)$/.exec(route))) {
+  if (!state.refs[match[1]]) fail('Reference does not exist (HTTP 422)');
+  delete state.refs[match[1]];
+  save();
+  process.exit(0);
+} else if ((match = /^releases\\/([0-9]+)$/.exec(route)) && ['GET', 'PATCH'].includes(method)) {
+  const release = state.releases.find((r) => r.id === Number(match[1]));
+  if (!release) fail('Not Found (HTTP 404)');
+  if (method === 'PATCH') {
+    // Like GitHub, a release update without tag_name leaves a draft with no tag.
+    release.tag_name = fields.tag_name === undefined ? '' : fields.tag_name;
+    release.target_commitish = fields.target_commitish;
+    release.name = fields.name;
+    release.body = fields.body;
+    save();
+  }
+  body = {
+    id: release.id,
+    draft: release.draft,
+    tag_name: release.tag_name,
+    target_commitish: release.target_commitish,
+    html_url: release.url,
+    author: { login: release.author },
+    body: release.body,
+  };
+} else if (method === 'POST' && route === 'releases/generate-notes') {
+  // Like GitHub, the notes of an existing tag end at that tag and ignore target_commitish.
+  if (state.notesDown) fail('Server Error (HTTP 502)');
+  const ref = state.refs[fields.tag_name];
+  body = { name: fields.tag_name, body: notes(ref ? ref.sha : fields.target_commitish) };
 } else if (method === 'PATCH' && (match = /^git\\/refs\\/tags\\/(.+)$/.exec(route))) {
   if (!state.refs[match[1]]) fail('Reference does not exist (HTTP 422)');
+  if (state.immutable && state.releases.some((r) => r.tag_name === match[1] && !r.draft)) {
+    fail('Cannot update a tag of an immutable release (HTTP 422)');
+  }
   state.refs[match[1]] = { type: 'commit', sha: fields.sha };
+  // What a maintainer may do to the draft while a run moves its tag, once.
+  const raced = state.releases.findIndex((r) => r.tag_name === match[1]);
+  if (state.onTagMove === 'publish') state.releases[raced].draft = false;
+  if (['replace', 'retag'].includes(state.onTagMove)) {
+    state.releases.splice(raced, 1, { ...state.releases[raced], id: 99, author: 'maintainer' });
+  }
+  if (state.onTagMove === 'retag') state.refs[match[1]] = { type: 'commit', sha: state.retagTo };
+  delete state.onTagMove;
+  // A move GitHub made whose response never reached the run, once.
+  const lost = state.lostResponse;
+  delete state.lostResponse;
   save();
+  if (lost) fail('connection reset by peer');
   body = {};
 } else if (method === 'POST' && route === 'git/refs') {
   const name = fields.ref.replace(/^refs\\/tags\\//, '');
@@ -368,7 +463,7 @@ const published = (...tags) => tags.map((tag) => ({ tag_name: tag, draft: false,
 /**
  * Runs the shell of `workflowStep` the way the runner does, with the fake `gh` over `state`.
  * `values` maps the expressions of the step's env, such as `needs.verify.outputs.tag`, to their
- * values. Returns `{ status, stderr, state, mutations, output, summary }`.
+ * values. Returns `{ status, stderr, state, calls, mutations, output, summary }`.
  */
 function runStep(workflowStep, state, values) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ttr-release-step-'));
@@ -393,6 +488,7 @@ function runStep(workflowStep, state, values) {
       GITHUB_REPOSITORY: 'owner/action',
       GITHUB_OUTPUT: file('output'),
       GITHUB_STEP_SUMMARY: file('summary'),
+      RUNNER_TEMP: dir,
       MOCK_STATE: file('state.json'),
       MOCK_LOG: file('calls'),
       ...env,
@@ -407,7 +503,14 @@ function runStep(workflowStep, state, values) {
     status: result.status,
     stderr: result.stderr,
     state: JSON.parse(fs.readFileSync(file('state.json'), 'utf8')),
-    mutations: calls.filter((c) => c.includes('PATCH') || c.includes('POST')),
+    calls,
+    // Generating notes reads; it writes nothing.
+    mutations: calls.filter(
+      (c) =>
+        (['PATCH', 'POST', 'DELETE'].some((method) => c.includes(method)) &&
+          !c.some((arg) => arg.endsWith('/releases/generate-notes'))) ||
+        (c[0] === 'release' && c[1] !== 'view')
+    ),
     output: fs.readFileSync(file('output'), 'utf8'),
     summary: fs.readFileSync(file('summary'), 'utf8'),
   };
@@ -625,5 +728,326 @@ describe('promoting the floating major against the published releases', () => {
     assert.match(run.stderr, /v1\.0\.1 resolves to d{40} instead of b{40}/);
     assert.deepStrictEqual(run.mutations, []);
     assert.strictEqual(run.state.refs.v1.sha, SHA.v100);
+  });
+});
+
+/** The draft step for `v1.0.0`, dispatched on main at `sha`. */
+function draft(state, sha) {
+  return runStep(step('draft', 'Create the exact tag and draft release'), state, {
+    'github.token': 'token',
+    'needs.prepare.outputs.tag': 'v1.0.0',
+    'needs.prepare.outputs.release-sha': sha
+  });
+}
+
+/** The draft an earlier run of this workflow created for `v1.0.0` at `SHA.v100`. */
+const ownDraft = (fields) => ({
+  id: 7,
+  tag_name: 'v1.0.0',
+  draft: true,
+  prerelease: false,
+  author: 'github-actions[bot]',
+  target_commitish: SHA.v100,
+  url: 'https://github.com/owner/action/releases/tag/untagged-earlier',
+  body: `Changes up to ${SHA.v100}`,
+  ...fields
+});
+
+describe('drafting against the releases and refs', () => {
+  test('a first dispatch creates the exact tag and a draft at the release commit', () => {
+    const run = draft({ releases: [], refs: {}, tags: {} }, SHA.v100);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v100 });
+    assert.strictEqual(run.state.releases[0].draft, true);
+    assert.strictEqual(run.state.releases[0].target_commitish, SHA.v100);
+    assert.match(run.summary, /Draft release: https:\/\/github\.com\/owner\/action\/releases\/tag\/untagged-new/);
+  });
+
+  test('a rerun after main moved moves its own draft and tag to the new commit', () => {
+    const state = {
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {}
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    const [release] = run.state.releases;
+    assert.strictEqual(release.draft, true);
+    assert.strictEqual(release.tag_name, 'v1.0.0');
+    assert.strictEqual(release.target_commitish, SHA.v101);
+    assert.strictEqual(release.body, `Changes up to ${SHA.v101}`, 'the notes end at the moved tag');
+    const endpoint = (call) =>
+      call
+        .find((arg) => arg.startsWith('repos/'))
+        .split('/')
+        .slice(3)
+        .join('/');
+    assert.deepStrictEqual(run.mutations.map(endpoint), ['git/refs/tags/v1.0.0', 'releases/7']);
+    assert.ok(run.mutations[0].includes('force=true'));
+    const order = run.calls.map((c) => (c[0] === 'api' ? endpoint(c) : c.slice(0, 2).join(' ')));
+    assert.ok(
+      order.indexOf('git/refs/tags/v1.0.0') < order.indexOf('releases/generate-notes'),
+      'the notes are generated after the tag moved'
+    );
+    assert.match(run.summary, /found the draft an earlier run created/);
+    assert.match(run.summary, /untagged-earlier/);
+  });
+
+  test('a rerun on the same commit changes nothing', () => {
+    const state = {
+      releases: [ownDraft({ target_commitish: SHA.v101, body: `Changes up to ${SHA.v101}` })],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v101 } },
+      tags: {}
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.mutations, []);
+    assert.ok(!run.calls.some((c) => c.some((arg) => arg.endsWith('/releases/generate-notes'))));
+    assert.deepStrictEqual(run.state, state);
+    assert.match(run.summary, /found the draft an earlier run created/);
+  });
+
+  test('a rerun on the same commit keeps the notes a maintainer edited', () => {
+    const state = {
+      releases: [ownDraft({ target_commitish: SHA.v101, body: 'Edited by a maintainer' })],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v101 } },
+      tags: {},
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.mutations, []);
+    assert.deepStrictEqual(run.state, state);
+  });
+
+  test('a draft on the release commit whose tag went missing gets it back and keeps its notes', () => {
+    const state = {
+      releases: [ownDraft({ target_commitish: SHA.v101, body: 'Edited by a maintainer' })],
+      refs: {},
+      tags: {},
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.deepStrictEqual(run.state.releases, state.releases);
+    assert.strictEqual(run.mutations.length, 1, 'only the tag');
+  });
+
+  test("a maintainer's draft on its own commit gets its missing tag and keeps its notes", () => {
+    const state = {
+      releases: [ownDraft({ author: 'maintainer', target_commitish: SHA.v101 })],
+      refs: {},
+      tags: {},
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.deepStrictEqual(run.state.releases, state.releases);
+  });
+
+  test('a rerun after a run that moved the tag but not the draft moves the draft', () => {
+    const state = {
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v101 } },
+      tags: {}
+    };
+    const run = draft(state, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.strictEqual(run.state.releases[0].target_commitish, SHA.v101);
+    assert.strictEqual(run.state.releases[0].body, `Changes up to ${SHA.v101}`);
+    assert.deepStrictEqual(
+      run.mutations.map((c) => c.find((arg) => arg.startsWith('repos/'))),
+      ['repos/owner/action/releases/7'],
+      'the tag is already current, so only the draft changes'
+    );
+  });
+
+  test('a rerun after the notes failed past the tag move updates the notes', () => {
+    const state = {
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {},
+      notesDown: true,
+    };
+    const failed = draft(state, SHA.v101);
+    assert.notStrictEqual(failed.status, 0);
+    assert.deepStrictEqual(failed.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.deepStrictEqual(failed.state.releases, state.releases);
+
+    const rerun = draft({ ...failed.state, notesDown: false }, SHA.v101);
+    assert.strictEqual(rerun.status, 0, rerun.stderr);
+    assert.strictEqual(rerun.state.releases[0].target_commitish, SHA.v101);
+    assert.strictEqual(rerun.state.releases[0].body, `Changes up to ${SHA.v101}`);
+    assert.deepStrictEqual(
+      rerun.mutations.map((c) => c.find((arg) => arg.startsWith('repos/'))),
+      ['repos/owner/action/releases/7'],
+      'the tag is already current, so only the draft changes'
+    );
+  });
+
+  test('a draft whose tag is missing gets the tag at the new commit, then moves', () => {
+    const run = draft({ releases: [ownDraft()], refs: {}, tags: {} }, SHA.v101);
+    assert.strictEqual(run.status, 0, run.stderr);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.strictEqual(run.state.releases[0].target_commitish, SHA.v101);
+    assert.strictEqual(run.state.releases[0].body, `Changes up to ${SHA.v101}`);
+  });
+
+  /** A refused run writes nothing and leaves the tag and the release as they were. */
+  const refused = (state, pattern) => {
+    const run = draft(state, SHA.v101);
+    assert.notStrictEqual(run.status, 0);
+    assert.match(run.stderr, pattern);
+    assert.deepStrictEqual(run.mutations, []);
+    assert.deepStrictEqual(run.state, state);
+  };
+
+  test('a published release keeps its tag', () => {
+    const release = ownDraft({
+      draft: false,
+      url: 'https://github.com/owner/action/releases/tag/v1.0.0'
+    });
+    refused(
+      { releases: [release], refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } }, tags: {} },
+      /Release v1\.0\.0 already exists and is published/
+    );
+  });
+
+  test('a draft someone else created keeps its tag and its target', () => {
+    const state = {
+      releases: [ownDraft({ author: 'maintainer' })],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {}
+    };
+    refused(state, /belongs to maintainer\.\nRefusing to retarget a draft that this workflow did not create/);
+    refused({ ...state, refs: {} }, /belongs to maintainer/);
+  });
+
+  test('a draft ahead of its tag keeps its tag and its notes', () => {
+    refused(
+      {
+        releases: [ownDraft({ target_commitish: SHA.v101 })],
+        refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+        tags: {},
+      },
+      /Draft release v1\.0\.0 targets b{40}, but its tag points to a{40}\.\nSomeone changed the draft or its tag by hand/
+    );
+  });
+
+  test('a tag with no draft stays where it is', () => {
+    refused(
+      { releases: [], refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } }, tags: {} },
+      /Tag v1\.0\.0 already points to a{40} instead of b{40}\.\nNo draft release of this workflow owns it/
+    );
+  });
+
+  test('a tag that is not a lightweight tag of a commit stays where it is', () => {
+    refused(
+      {
+        releases: [ownDraft()],
+        refs: { 'v1.0.0': { type: 'tag', sha: ANNOTATED } },
+        tags: { [ANNOTATED]: { type: 'commit', sha: SHA.v100 } }
+      },
+      /Tag v1\.0\.0 points to a tag object instead of a commit/
+    );
+    refused(
+      { releases: [ownDraft()], refs: { 'v1.0.0': { type: 'tree', sha: SHA.other } }, tags: {} },
+      /points to a tree object instead of a commit/
+    );
+  });
+
+  test('a draft published or replaced while its tag moves stops the run and gets its tag back', () => {
+    const state = (onTagMove) => ({
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {},
+      onTagMove,
+    });
+
+    const published = draft(state('publish'), SHA.v101);
+    assert.notStrictEqual(published.status, 0);
+    assert.match(published.stderr, /Release v1\.0\.0 stopped being the draft this run checked/);
+    assert.strictEqual(published.state.releases[0].target_commitish, SHA.v100);
+
+    const replaced = draft(state('replace'), SHA.v101);
+    assert.notStrictEqual(replaced.status, 0);
+    assert.match(replaced.stderr, /stopped being the draft this run checked/);
+    assert.deepStrictEqual(replaced.state.releases[0], {
+      ...ownDraft(),
+      id: 99,
+      author: 'maintainer',
+    });
+    for (const run of [published, replaced]) {
+      assert.match(run.stderr, /Tag v1\.0\.0 is back at a{40}\./);
+      assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v100 });
+      assert.strictEqual(run.mutations.length, 2, 'the tag moved and moved back, nothing else');
+    }
+  });
+
+  test('a tag someone else moved while the run moved it stays where they put it', () => {
+    const state = {
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {},
+      onTagMove: 'retag',
+      retagTo: SHA.other,
+    };
+    const run = draft(state, SHA.v101);
+    assert.notStrictEqual(run.status, 0);
+    assert.match(run.stderr, /Tag v1\.0\.0 now points to d{40}, so this run leaves it there/);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.other });
+    assert.strictEqual(run.mutations.length, 1, 'only the first move');
+  });
+
+  test('a tag move whose response was lost is read back', () => {
+    const state = (fields) => ({
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {},
+      lostResponse: true,
+      ...fields,
+    });
+
+    const moved = draft(state(), SHA.v101);
+    assert.strictEqual(moved.status, 0, moved.stderr);
+    assert.deepStrictEqual(moved.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.strictEqual(moved.state.releases[0].target_commitish, SHA.v101);
+    assert.strictEqual(moved.state.releases[0].body, `Changes up to ${SHA.v101}`);
+
+    const published = draft(state({ onTagMove: 'publish' }), SHA.v101);
+    assert.notStrictEqual(published.status, 0);
+    assert.match(published.stderr, /Tag v1\.0\.0 is back at a{40}\./);
+    assert.deepStrictEqual(published.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v100 });
+  });
+
+  test('with immutable releases, a draft published before its tag moves keeps its tag', () => {
+    const state = {
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {},
+      immutable: true,
+      onView: 'publish',
+    };
+    const run = draft(state, SHA.v101);
+    assert.notStrictEqual(run.status, 0);
+    assert.match(run.stderr, /Cannot update a tag of an immutable release/);
+    assert.match(run.stderr, /Tag v1\.0\.0 stays at a{40}\./);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v100 });
+    assert.deepStrictEqual(run.state.releases[0], ownDraft({ draft: false }));
+  });
+
+  test('with immutable releases, a draft published right after its tag moved keeps that tag', () => {
+    const state = {
+      releases: [ownDraft()],
+      refs: { 'v1.0.0': { type: 'commit', sha: SHA.v100 } },
+      tags: {},
+      immutable: true,
+      onTagMove: 'publish',
+    };
+    const run = draft(state, SHA.v101);
+    assert.notStrictEqual(run.status, 0);
+    assert.match(run.stderr, /Tag v1\.0\.0 could not move back to a{40}\. Check which commit/);
+    assert.deepStrictEqual(run.state.refs['v1.0.0'], { type: 'commit', sha: SHA.v101 });
+    assert.deepStrictEqual(run.state.releases[0], ownDraft({ draft: false }));
   });
 });
