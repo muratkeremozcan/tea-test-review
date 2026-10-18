@@ -3,6 +3,8 @@
 # Run workflow on main with a bump: the prepare job runs every gate the repository defines and a
 # smoke of the Action from this checkout, derives the next exact vX.Y.Z from the published
 # releases, and the draft job creates that exact tag and a draft release with generated notes.
+# A rerun after main moved moves that draft and its exact tag to the newer commit while the draft
+# is unpublished, and regenerates its notes.
 #
 # Publish the draft with the Marketplace box ticked: the verify job checks the published tag,
 # reruns the gates and the smoke on it and waits for the Marketplace to list it, and the promote
@@ -118,15 +120,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag_preexisted=false
+          # The exact tag is missing, current at the release commit, or stale at another object.
+          tag_state=missing
           created_tag=false
           if ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
+            existing_type=$(jq -r '.object.type' <<< "$ref")
             existing_sha=$(jq -r '.object.sha' <<< "$ref")
-            if [ "$existing_sha" != "$RELEASE_SHA" ]; then
-              echo "Tag $TAG already points to $existing_sha instead of $RELEASE_SHA." >&2
-              exit 1
+            if [ "$existing_sha" = "$RELEASE_SHA" ]; then
+              tag_state=current
+            else
+              tag_state=stale
             fi
-            tag_preexisted=true
           fi
 
           create_exact_tag() {
@@ -136,6 +140,14 @@ jobs:
               -f ref="refs/tags/$TAG" \
               -f sha="$RELEASE_SHA" >/dev/null
             created_tag=true
+          }
+
+          move_exact_tag() {
+            gh api \
+              --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" \
+              -f sha="$1" \
+              -F force=true >/dev/null
           }
 
           verify_exact_tag() {
@@ -176,53 +188,115 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
+          # A rerun after main moved finds the draft and the exact tag an earlier run created at an
+          # older commit. Only an unpublished draft this workflow created moves, and its lightweight
+          # tag moves with it. Every check runs before the first write, and every read and write after
+          # the lookup addresses the draft by its id, so a draft that replaced it in between stays put.
           if release=$(gh release view "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --json author,isDraft,tagName,targetCommitish,url 2>/dev/null); then
+            --json author,body,databaseId,isDraft,tagName,targetCommitish,url 2>/dev/null); then
             validate_draft "$release"
-            if [ "$tag_preexisted" = 'false' ]; then
-              release_target=$(jq -r '.targetCommitish' <<< "$release")
-              if [ "$release_target" != "$RELEASE_SHA" ]; then
-                release_author=$(jq -r '.author.login' <<< "$release")
-                if [ "$release_author" != 'github-actions[bot]' ]; then
-                  echo "Draft release $TAG targets $release_target and belongs to $release_author." >&2
-                  echo "Refusing to retarget a draft that this workflow did not create." >&2
-                  exit 1
-                fi
+            release_id=$(jq -r '.databaseId' <<< "$release")
+            release_target=$(jq -r '.targetCommitish' <<< "$release")
+            release_author=$(jq -r '.author.login' <<< "$release")
 
-                release_notes_file="$RUNNER_TEMP/$TAG-release-notes.md"
-                gh api \
-                  --method POST \
-                  "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
-                  -f tag_name="$TAG" \
-                  -f target_commitish="$RELEASE_SHA" \
-                  --jq '.body' > "$release_notes_file"
-                gh release edit "$TAG" \
-                  --repo "$GITHUB_REPOSITORY" \
-                  --target "$RELEASE_SHA" \
-                  --title "$TAG" \
-                  --notes-file "$release_notes_file" >/dev/null
+            read_release() {
+              gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+                --jq '{author: {login: .author.login}, isDraft: .draft, tagName: .tag_name, targetCommitish: .target_commitish, url: .html_url}'
+            }
 
-                release=$(gh release view "$TAG" \
-                  --repo "$GITHUB_REPOSITORY" \
-                  --json author,isDraft,tagName,targetCommitish,url)
-                validate_draft "$release"
-                release_target=$(jq -r '.targetCommitish' <<< "$release")
-                if [ "$release_target" != "$RELEASE_SHA" ]; then
-                  echo "Retargeted draft $TAG still targets $release_target instead of $RELEASE_SHA." >&2
-                  exit 1
-                fi
+            if [ "$release_author" != 'github-actions[bot]' ] \
+              && { [ "$tag_state" = 'stale' ] || [ "$release_target" != "$RELEASE_SHA" ]; }; then
+              if [ "$tag_state" = 'stale' ]; then
+                echo "Tag $TAG already points to $existing_sha instead of $RELEASE_SHA." >&2
               fi
+              echo "Draft release $TAG targets $release_target and belongs to $release_author." >&2
+              echo "Refusing to retarget a draft that this workflow did not create." >&2
+              exit 1
+            fi
+            if [ "$tag_state" = 'stale' ] && [ "$existing_type" != 'commit' ]; then
+              echo "Tag $TAG points to a $existing_type object instead of a commit." >&2
+              echo 'Refusing to move a tag that this workflow did not create.' >&2
+              exit 1
+            fi
+
+            if [ "$tag_state" = 'stale' ]; then
+              # A move whose response was lost may still have happened, so the run reads the state back
+              # whether the move succeeded or not, and verify_exact_tag below stops a move that did not.
+              move_exact_tag "$RELEASE_SHA" || true
+              # Release immutability refuses to move the tag of a published release, so a publication
+              # before the move keeps the tag where it was. The token cannot read that setting, so a
+              # draft that was published, deleted or replaced around the move also shows here: a tag
+              # this run moved goes back to the commit it had, and the run stops. A tag someone else
+              # moved meanwhile stays where they put it. Immutability refuses the move back for a
+              # release published after the move, and the tag then stays with that release.
+              moved_release=$(read_release) || moved_release='{}'
+              if [ "$(jq -r '.isDraft' <<< "$moved_release")" != 'true' ] \
+                || [ "$(jq -r '.tagName' <<< "$moved_release")" != "$TAG" ]; then
+                echo "Release $TAG stopped being the draft this run checked while its tag moved from $existing_sha to $RELEASE_SHA." >&2
+                current_sha=$(gh api \
+                  "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+                  --jq '.object.sha' 2>/dev/null) || current_sha=missing
+                if [ "$current_sha" = "$RELEASE_SHA" ]; then
+                  if move_exact_tag "$existing_sha"; then
+                    echo "Tag $TAG is back at $existing_sha." >&2
+                  else
+                    echo "Tag $TAG could not move back to $existing_sha. Check which commit it belongs on before the next run." >&2
+                  fi
+                elif [ "$current_sha" = "$existing_sha" ]; then
+                  echo "Tag $TAG stays at $existing_sha." >&2
+                else
+                  echo "Tag $TAG now points to $current_sha, so this run leaves it there." >&2
+                fi
+                exit 1
+              fi
+            elif [ "$tag_state" = 'missing' ]; then
               create_exact_tag
             fi
             verify_exact_tag
+
+            # The notes of an existing tag end at that tag, so they are generated once it is in place.
+            # Each run compares them, so a rerun after a run that stopped past the tag still updates them.
+            if [ "$release_author" = 'github-actions[bot]' ]; then
+              release_notes=$(gh api \
+                --method POST \
+                "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+                -f tag_name="$TAG" \
+                -f target_commitish="$RELEASE_SHA" \
+                --jq '.body')
+              if [ "$release_target" != "$RELEASE_SHA" ] \
+                || [ "$release_notes" != "$(jq -r '.body' <<< "$release")" ]; then
+                release_notes_file="$RUNNER_TEMP/$TAG-release-notes.md"
+                printf '%s\n' "$release_notes" > "$release_notes_file"
+                gh api \
+                  --method PATCH \
+                  "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+                  -f tag_name="$TAG" \
+                  -f target_commitish="$RELEASE_SHA" \
+                  -f name="$TAG" \
+                  -F body=@"$release_notes_file" >/dev/null
+              fi
+            fi
+
+            release=$(read_release)
+            validate_draft "$release"
+            release_target=$(jq -r '.targetCommitish' <<< "$release")
+            if [ "$release_target" != "$RELEASE_SHA" ]; then
+              echo "Draft $TAG targets $release_target instead of $RELEASE_SHA." >&2
+              exit 1
+            fi
             url=$(jq -r '.url' <<< "$release")
             echo 'This run found the draft an earlier run created.' >> "$GITHUB_STEP_SUMMARY"
             publish_steps "$url"
             exit 0
           fi
 
-          if [ "$tag_preexisted" = 'false' ]; then
+          if [ "$tag_state" = 'stale' ]; then
+            echo "Tag $TAG already points to $existing_sha instead of $RELEASE_SHA." >&2
+            echo 'No draft release of this workflow owns it, so it stays where it is.' >&2
+            exit 1
+          fi
+          if [ "$tag_state" = 'missing' ]; then
             create_exact_tag
           fi
 
